@@ -1,12 +1,9 @@
 services:
-  - type: web
-    name: swayamquizbot
+  - type: worker
+    name: swayam-quiz-bot
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      - key: BOT_TOKEN
         sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
