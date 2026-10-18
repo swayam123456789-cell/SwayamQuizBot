@@ -59,7 +59,7 @@ def init_db():
         );
         """)
 
-TITLE, TOPIC, INTRO, TIMER, QUESTION, A, B, C, D, ANSWER = range(11)
+TITLE, TOPIC, INTRO, FUNNY,TIMER, QUESTION, A, B, C, D, ANSWER = range(11)
 
 def main_menu():
     return InlineKeyboardMarkup([
