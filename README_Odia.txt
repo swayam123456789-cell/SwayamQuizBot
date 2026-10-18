@@ -1,39 +1,34 @@
-SwayamQuizBot — Friendly Quiz Builder Starter (Odia)
+SwayamQuizBot — Telegram-only starter
 
-IMPORTANT HONEST LIMITATION:
-This package includes the Telegram bot menu, manual question builder, copy-paste MCQ parser, SQLite quiz/question/attempt schema, result/leaderboard commands, and cutoff calculation based on saved attempts.
-A real shareable web quiz page that collects participant answers and writes attempts to the database is NOT included in this starter yet. Until that web page/backend is added, the participant leaderboard will remain empty unless attempts are recorded. Do not advertise the public link as working yet.
+IMPORTANT
+- This is a starter implementation. Test with a private test quiz before using it publicly.
+- Never upload your Telegram bot token to GitHub.
+- Hosting must support HTTPS webhooks and a running Python web service.
+- SQLite data on many free hosts can be lost when the service restarts/redeploys unless persistent storage is configured. Do not rely on this for important exam results without persistent database storage.
+- Render free web services may sleep and have resource limitations. Free hosting availability/terms can change.
 
-SECURITY:
-- Never upload the Telegram bot token to GitHub.
-- Set TELEGRAM_BOT_TOKEN only as a hosting secret/environment variable.
-- If token was shown in screenshots, revoke it in BotFather and use a new token.
-- Keep the repository public only for source code without secrets.
+Environment variables
+TELEGRAM_BOT_TOKEN = token from BotFather (store only in hosting secrets)
+RENDER_EXTERNAL_URL = public HTTPS URL of your deployed service (Render provides this)
+WEBHOOK_SECRET = a long random secret string
+PORT = usually supplied automatically by host
+DATABASE_PATH = optional path for SQLite file
 
-Environment:
-TELEGRAM_BOT_TOKEN = your new BotFather token (secret only)
-PUBLIC_BASE_URL = public HTTPS URL of the deployed web app (leave unset until web app exists)
-DATABASE_PATH = swayam_quiz.db (optional; use persistent storage)
+Commands in Telegram
+/start
+/help
+/newquiz Quiz title
+/addq CODE
+/import CODE
+/link CODE
+/leaderboard CODE
+/close CODE
+/cancel
 
-Run locally:
-pip install -r requirements.txt
-python bot.py
+Question format (one line)
+Question text | Option A | Option B | Option C | Option D | correct option number (1-4)
 
-Telegram commands:
- /start - menu
- /newquiz - manual quiz
- /addq - add another question
- /publishquiz - save draft quiz
- /results CODE - results and Top 10
- /leaderboard CODE - Top 10
- /cancel - cancel current flow
+For bulk import, send one question per line after /import CODE.
+Participants open the link and complete the quiz in the bot's private chat. The bot uses non-anonymous Telegram quiz polls to track answers. Each participant may attempt each quiz once.
 
-Copy-paste format:
-Q1. What is the capital of India?
-A) Mumbai
-B) New Delhi
-C) Cuttack
-D) Chennai
-Answer: B
-
-Hosting and the actual web quiz page/backend must be completed before users can take quizzes via a shareable link and before automatic score collection works.
+Top 10 sorts by score, then by shortest elapsed time. The cutoff is the score of rank 10 when at least 10 participants have completed the quiz. The /close command prevents new starts; it does not force unfinished attempts to submit.

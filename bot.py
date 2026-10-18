@@ -1,336 +1,358 @@
 import os
 import re
+import json
 import time
 import sqlite3
 import secrets
 import logging
 from datetime import datetime, timezone
+from telegram import Update, Poll
+from telegram.ext import Application, CommandHandler, MessageHandler, PollAnswerHandler, ContextTypes, filters
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo,
-)
-from telegram.constants import PollType
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-)
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', secrets.token_urlsafe(24))
+PORT = int(os.environ.get('PORT', '10000'))
+DB_PATH = os.environ.get('DATABASE_PATH', 'swayam_quiz.db')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-DB_PATH = os.environ.get("DATABASE_PATH", "swayam_quiz.db")
 if not TOKEN:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN as a secret/environment variable.")
+    raise RuntimeError('Set TELEGRAM_BOT_TOKEN in the hosting environment variables.')
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-QUESTION, OPTIONS, ANSWER, TITLE = range(4)
-DB = None
+# Temporary prompts for each Telegram user. Quiz data itself is stored in SQLite.
+PENDING = {}
+POLL_CACHE = {}
 
-def db():
-    global DB
-    if DB is None:
-        DB = sqlite3.connect(DB_PATH, check_same_thread=False)
-        DB.row_factory = sqlite3.Row
-        DB.execute("PRAGMA journal_mode=WAL")
-        DB.executescript("""
+def conn():
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    return c
+
+def init_db():
+    with conn() as c:
+        c.executescript('''
         CREATE TABLE IF NOT EXISTS quizzes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          code TEXT UNIQUE NOT NULL,
-          owner_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          is_published INTEGER NOT NULL DEFAULT 0
+          code TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, title TEXT NOT NULL,
+          created_at TEXT NOT NULL, closed INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS questions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          quiz_code TEXT NOT NULL,
-          position INTEGER NOT NULL,
-          question TEXT NOT NULL,
-          options_json TEXT NOT NULL,
-          correct_index INTEGER NOT NULL
+          id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL, pos INTEGER NOT NULL,
+          question TEXT NOT NULL, options_json TEXT NOT NULL, correct_index INTEGER NOT NULL,
+          UNIQUE(code, pos)
         );
         CREATE TABLE IF NOT EXISTS attempts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          quiz_code TEXT NOT NULL,
-          participant_id TEXT NOT NULL,
-          display_name TEXT NOT NULL,
-          score INTEGER NOT NULL,
-          total INTEGER NOT NULL,
-          elapsed_seconds INTEGER NOT NULL,
-          submitted_at TEXT NOT NULL,
-          UNIQUE(quiz_code, participant_id)
+          code TEXT NOT NULL, user_id INTEGER NOT NULL, display_name TEXT NOT NULL,
+          score INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
+          current_pos INTEGER NOT NULL DEFAULT 0, started_at REAL NOT NULL,
+          finished_at REAL, finished INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(code, user_id)
         );
-        """)
-        DB.commit()
-    return DB
+        CREATE TABLE IF NOT EXISTS polls (
+          poll_id TEXT PRIMARY KEY, code TEXT NOT NULL, pos INTEGER NOT NULL,
+          user_id INTEGER NOT NULL
+        );
+        ''')
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def parse_mcqs(text):
-    blocks = re.split(r"(?im)(?=^\s*(?:Q(?:uestion)?\s*)?\d+\s*[\).:\-])", text.strip())
-    out = []
-    for block in blocks:
-        lines = [x.strip() for x in block.splitlines() if x.strip()]
-        if not lines:
-            continue
-        qlines, opts, ans = [], {}, None
-        for line in lines:
-            m = re.match(r"^\s*([A-D])\s*[\)\.\:\-]\s*(.+)$", line, re.I)
-            if m:
-                opts[m.group(1).upper()] = m.group(2).strip()
-                continue
-            m = re.match(r"^\s*(?:correct\s*)?(?:answer|ans)\s*[:\-]?\s*([A-D])\b", line, re.I)
-            if m:
-                ans = m.group(1).upper()
-                continue
-            qlines.append(line)
-        q = "\n".join(qlines).strip()
-        q = re.sub(r"^\s*(?:Q(?:uestion)?\s*)?\d+\s*[\).:\-]\s*", "", q, flags=re.I).strip()
-        if q and all(k in opts for k in "ABCD") and ans in opts:
-            out.append({"question": q[:300], "options": [opts[k][:100] for k in "ABCD"], "correct_index": "ABCD".index(ans)})
-    return out
+def make_code():
+    return secrets.token_hex(3).upper()
 
-def create_quiz(owner_id, title, questions):
-    d = db()
-    code = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
-    d.execute("INSERT INTO quizzes(code,owner_id,title,created_at,is_published) VALUES(?,?,?,?,0)",
-              (code, owner_id, title[:100], now_iso()))
-    for i, q in enumerate(questions, 1):
-        d.execute("INSERT INTO questions(quiz_code,position,question,options_json,correct_index) VALUES(?,?,?,?,?)",
-                  (code, i, q["question"], json.dumps(q["options"], ensure_ascii=False), q["correct_index"]))
-    d.commit()
-    return code
+def quiz_row(code):
+    with conn() as c:
+        return c.execute('SELECT * FROM quizzes WHERE code=?', (code.upper(),)).fetchone()
 
 def get_questions(code):
-    return db().execute("SELECT * FROM questions WHERE quiz_code=? ORDER BY position", (code,)).fetchall()
+    with conn() as c:
+        return c.execute('SELECT * FROM questions WHERE code=? ORDER BY pos', (code.upper(),)).fetchall()
 
-def leaderboard(code):
-    return db().execute(
-        "SELECT * FROM attempts WHERE quiz_code=? ORDER BY score DESC, elapsed_seconds ASC, submitted_at ASC LIMIT 10",
-        (code,)
-    ).fetchall()
-
-def cutoff_score(code):
-    rows = db().execute(
-        "SELECT score FROM attempts WHERE quiz_code=? ORDER BY score DESC, elapsed_seconds ASC, submitted_at ASC LIMIT 10",
-        (code,)
-    ).fetchall()
-    return rows[9]["score"] if len(rows) >= 10 else (min([r["score"] for r in rows]) if rows else None)
-
-def quiz_url(code):
-    return f"{PUBLIC_BASE_URL}/quiz/{code}" if PUBLIC_BASE_URL else ""
+def parse_question_line(line):
+    # Format: Question | option A | option B | option C | option D | correct option (1-4)
+    parts = [p.strip() for p in line.split('|')]
+    if len(parts) != 6 or any(not p for p in parts):
+        raise ValueError('ପ୍ରତ୍ୟେକ ଲାଇନ୍‌ରେ ୬ଟି ଭାଗ ଦରକାର: ପ୍ରଶ୍ନ | A | B | C | D | ସଠିକ୍ ଅପ୍ସନ୍ ନମ୍ବର (1-4)')
+    try:
+        correct = int(parts[5]) - 1
+    except ValueError:
+        raise ValueError('ଶେଷ ଭାଗରେ ସଠିକ୍ ଅପ୍ସନ୍ ନମ୍ବର 1, 2, 3 କିମ୍ବା 4 ଲେଖ।')
+    if correct not in range(4):
+        raise ValueError('ସଠିକ୍ ଅପ୍ସନ୍ ନମ୍ବର 1 ରୁ 4 ମଧ୍ୟରେ ହେବା ଦରକାର।')
+    if len(parts[0]) > 300 or any(len(x) > 100 for x in parts[1:5]):
+        raise ValueError('ପ୍ରଶ୍ନ କିମ୍ବା ଅପ୍ସନ୍ ଅତ୍ୟଧିକ ଲମ୍ବା।')
+    return parts[0], parts[1:5], correct
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("➕ Manual Quiz ବନାଅ", callback_data="manual")],
-        [InlineKeyboardButton("📋 Copy-Paste MCQ", callback_data="paste")],
-        [InlineKeyboardButton("📊 ମୋ Quiz ଗୁଡ଼ିକ", callback_data="myquizzes")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-    ]
+    user = update.effective_user
+    if context.args:
+        code = context.args[0].upper()
+        await begin_quiz(update, context, code)
+        return
     await update.effective_message.reply_text(
-        "ନମସ୍କାର! 👋 ମୁଁ Swayam Quiz Bot।\n\n"
-        "ସହଜରେ Quiz ବନାଅ, Link Share କର ଏବଂ Result ଦେଖ।\n"
-        "Quiz ଶେଷରେ Score, Top 10 Leaderboard ଓ Top 10 Cutoff ମିଳିବ।\n\n"
-        "ତଳର Menu ରୁ ବାଛ:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+        'ନମସ୍କାର! ଏହା Swayam Quiz Bot.\n\n'
+        'ନୂଆ Quiz: /newquiz Quiz ନାମ\n'
+        'ପ୍ରଶ୍ନ ଯୋଡ଼: /addq CODE\n'
+        'ଏକାଥରେ ଅନେକ ପ୍ରଶ୍ନ: /import CODE\n'
+        'Quiz link: /link CODE\n'
+        'Leaderboard: /leaderboard CODE\n'
+        'Quiz ବନ୍ଦ: /close CODE\n'
+        'Quiz ର code ଓ ସହାୟତା: /help')
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "manual":
-        context.user_data["draft"] = []
-        await q.message.reply_text("📝 Manual Quiz ଆରମ୍ଭ। ପ୍ରଥମେ Quiz ର ନାମ ପଠାଅ।")
-        return TITLE
-    if q.data == "paste":
-        context.user_data["awaiting_paste"] = True
-        await q.message.reply_text(
-            "📋 ଏକ message ରେ MCQ ପଠାଅ। Format:\n\n"
-            "Q1. ଭାରତର ରାଜଧାନୀ କ'ଣ?\nA) ମୁମ୍ବାଇ\nB) ନୂଆଦିଲ୍ଲୀ\nC) କଟକ\nD) ଚେନ୍ନାଇ\nAnswer: B\n\n"
-            "ପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନରେ Q1., A-D options ଓ Answer: B ରହିବ।"
-        )
-        return ConversationHandler.END
-    if q.data == "myquizzes":
-        rows = db().execute("SELECT code,title,is_published FROM quizzes WHERE owner_id=? ORDER BY id DESC LIMIT 10",
-                            (q.from_user.id,)).fetchall()
-        if not rows:
-            await q.message.reply_text("ଏପର୍ଯ୍ୟନ୍ତ Quiz ନାହିଁ। ➕ Manual Quiz କିମ୍ବା 📋 Copy-Paste ବାଛ।")
-            return ConversationHandler.END
-        lines = ["📚 ତୁମର Quiz:"]
-        for r in rows:
-            lines.append(f"• {r['title']} — code: {r['code']} — {'Published' if r['is_published'] else 'Draft'}")
-            lines.append(f"  /results_{r['code']}")
-        await q.message.reply_text("\n".join(lines))
-        return ConversationHandler.END
-    if q.data == "help":
-        await q.message.reply_text(
-            "Manual: /newquiz → title → question → options → answer → /addq → /publishquiz\n"
-            "Copy-Paste: Q1., A), B), C), D), Answer: B format ରେ ପଠାଅ।\n"
-            "Leaderboard: /leaderboard CODE\n"
-            "Results: /results CODE\n\n"
-            "Shareable web quiz ଓ automatic scoring ପାଇଁ app କୁ host କରି PUBLIC_BASE_URL ସେଟ୍ କରିବା ଆବଶ୍ୟକ।"
-        )
-    return ConversationHandler.END
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        'ବ୍ୟବହାର ପ୍ରଣାଳୀ\n\n'
+        '1) /newquiz Indian Polity ଲେଖ।\n'
+        '2) Bot ଯେଉଁ CODE ଦେବ, ତାହା ରଖ।\n'
+        '3) /addq CODE ଲେଖି ଗୋଟିଏ ପ୍ରଶ୍ନ ପଠାଅ।\n'
+        '4) ପ୍ରଶ୍ନର ଫର୍ମାଟ୍: ପ୍ରଶ୍ନ | ଅପ୍ସନ A | ଅପ୍ସନ B | ଅପ୍ସନ C | ଅପ୍ସନ D | ସଠିକ୍ ନମ୍ବର (1-4)\n'
+        '5) ଅନେକ ପ୍ରଶ୍ନ ପାଇଁ /import CODE ଲେଖି ଏକାଧିକ ଲାଇନ୍ ପଠାଅ।\n'
+        '6) /link CODE ଦ୍ୱାରା ଲିଙ୍କ୍ ନିଅ ଏବଂ share କର।\n'
+        '7) /close CODE କଲେ quiz ବନ୍ଦ ହେବ ଏବଂ Top 10/cutoff ଦେଖାଯିବ।\n\n'
+        'ଧ୍ୟାନ: ଗୋଟିଏ user ପ୍ରତି quiz ରେ ଗୋଟିଏ attempt ଦେଇପାରିବ।')
 
 async def newquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["draft"] = []
-    await update.effective_message.reply_text("Quiz ର ନାମ ପଠାଅ:")
-    return TITLE
-
-async def title_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["draft_title"] = (update.effective_message.text or "My Quiz").strip()[:100]
+    title = ' '.join(context.args).strip()
+    if not title:
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /newquiz September Current Affairs')
+        return
+    code = make_code()
+    with conn() as c:
+        while c.execute('SELECT 1 FROM quizzes WHERE code=?', (code,)).fetchone():
+            code = make_code()
+        c.execute('INSERT INTO quizzes(code, owner_id, title, created_at) VALUES(?,?,?,?)',
+                   (code, update.effective_user.id, title[:100], now_iso()))
     await update.effective_message.reply_text(
-        "ପ୍ରଶ୍ନ ପଠାଅ। ତା'ପରେ ଚାରିଟି option ପଠାଇବାକୁ କହିବି।"
-    )
-    return QUESTION
-
-async def question_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["pending_q"] = (update.effective_message.text or "").strip()[:300]
-    if not context.user_data["pending_q"]:
-        await update.effective_message.reply_text("ପ୍ରଶ୍ନ text ପଠାଅ।")
-        return QUESTION
-    await update.effective_message.reply_text("ଚାରିଟି option ପଠାଅ:\nA) ...\nB) ...\nC) ...\nD) ...")
-    return OPTIONS
-
-async def options_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    opts = {}
-    for line in (update.effective_message.text or "").splitlines():
-        m = re.match(r"^\s*([A-D])\s*[\)\.\:\-]\s*(.+)$", line.strip(), re.I)
-        if m:
-            opts[m.group(1).upper()] = m.group(2).strip()
-    if not all(k in opts for k in "ABCD"):
-        await update.effective_message.reply_text("A), B), C), D) ଚାରିଟି option ଦିଅ।")
-        return OPTIONS
-    context.user_data["pending_opts"] = [opts[k][:100] for k in "ABCD"]
-    await update.effective_message.reply_text("Correct answer କେଉଁଟି? କେବଳ A, B, C କିମ୍ବା D ପଠାଅ।")
-    return ANSWER
-
-async def answer_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ans = (update.effective_message.text or "").strip().upper()
-    m = re.fullmatch(r"(?:ANSWER\s*[:\-]?\s*)?([A-D])", ans)
-    if not m:
-        await update.effective_message.reply_text("କେବଳ A, B, C କିମ୍ବା D ପଠାଅ।")
-        return ANSWER
-    context.user_data.setdefault("draft", []).append({
-        "question": context.user_data.pop("pending_q"),
-        "options": context.user_data.pop("pending_opts"),
-        "correct_index": "ABCD".index(m.group(1))
-    })
-    n = len(context.user_data["draft"])
-    await update.effective_message.reply_text(
-        f"✅ ପ୍ରଶ୍ନ ଯୋଡ଼ାଗଲା। ମୋଟ {n}ଟି।\n"
-        "ଆଉ ପ୍ରଶ୍ନ ପାଇଁ /addq ଲେଖ; ସବୁ ସରିଲେ /publishquiz ଲେଖ।"
-    )
-    return ConversationHandler.END
+        f'Quiz ତିଆରି ହେଲା!\nTitle: {title[:100]}\nCode: {code}\n\n'
+        f'ଗୋଟିଏ ପ୍ରଶ୍ନ ପାଇଁ: /addq {code}\n'
+        f'ଏକାଥରେ ଅନେକ ପ୍ରଶ୍ନ ପାଇଁ: /import {code}\n'
+        f'ପ୍ରଶ୍ନ ଯୋଡ଼ି ସାରିଲେ: /link {code}')
 
 async def addq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "draft" not in context.user_data:
-        context.user_data["draft"] = []
-        await update.effective_message.reply_text("ପ୍ରଥମେ /newquiz କରି Quiz ଆରମ୍ଭ କର।")
-        return ConversationHandler.END
-    await update.effective_message.reply_text("ପରବର୍ତ୍ତୀ ପ୍ରଶ୍ନ ପଠାଅ:")
-    return QUESTION
-
-async def publishquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    draft = context.user_data.get("draft", [])
-    if not draft:
-        await update.effective_message.reply_text("ପ୍ରଥମେ /newquiz କରି ପ୍ରଶ୍ନ ଯୋଡ଼।")
-        return
-    title = context.user_data.get("draft_title", "My Quiz")
-    code = create_quiz(update.effective_user.id, title, draft)
-    context.user_data.pop("draft", None)
-    context.user_data.pop("draft_title", None)
-    d = db()
-    d.execute("UPDATE quizzes SET is_published=1 WHERE code=?", (code,))
-    d.commit()
-    url = quiz_url(code)
-    msg = f"🎉 Quiz ସେଭ୍ ହେଲା!\n\n📘 {title}\n🧮 ପ୍ରଶ୍ନ: {len(draft)}\n🔑 Code: {code}"
-    if url:
-        msg += f"\n\n🔗 Quiz Link: {url}\nଏହି Link Channel ରେ Share କର।"
-    else:
-        msg += "\n\n⚠️ Quiz Link ପାଇଁ Hosting ସେଟ୍ ହେବା ବାକି ଅଛି।"
-    msg += f"\n\nResult: /results {code}\nTop 10: /leaderboard {code}"
-    await update.effective_message.reply_text(msg)
-
-async def copy_paste_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_paste"):
-        # allow format to work without button too
-        text = update.effective_message.text or ""
-        if not re.search(r"(?im)^\s*(?:Q(?:uestion)?\s*)?\d+\s*[\).:\-]", text):
-            return
-    text = update.effective_message.text or ""
-    questions = parse_mcqs(text)
-    context.user_data["awaiting_paste"] = False
-    if not questions:
-        await update.effective_message.reply_text("MCQ ବୁଝିପାରିଲି ନାହିଁ। /help ଦେଖି format ଅନୁସାରେ ପଠାଅ।")
-        return
-    context.user_data["draft"] = questions
-    context.user_data["draft_title"] = "MCQ Quiz " + datetime.now().strftime("%d-%m %H:%M")
-    await update.effective_message.reply_text(
-        f"✅ {len(questions)}ଟି MCQ ମିଳିଲା। /publishquiz ଲେଖି Quiz ସେଭ୍ କର।"
-    )
-
-async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.effective_message.reply_text("ବ୍ୟବହାର: /results QUIZCODE")
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /addq CODE')
         return
-    code = context.args[0]
-    quiz = db().execute("SELECT * FROM quizzes WHERE code=?", (code,)).fetchone()
-    if not quiz:
-        await update.effective_message.reply_text("Quiz Code ମିଳିଲା ନାହିଁ।")
+    code = context.args[0].upper()
+    q = quiz_row(code)
+    if not q or q['owner_id'] != update.effective_user.id:
+        await update.effective_message.reply_text('ଏହି quiz code ମିଳୁନାହିଁ କିମ୍ବା ଏହା ତୁମର quiz ନୁହେଁ।')
         return
-    rows = db().execute("SELECT * FROM attempts WHERE quiz_code=? ORDER BY score DESC, elapsed_seconds ASC LIMIT 10",
-                        (code,)).fetchall()
-    total = db().execute("SELECT COUNT(*) n FROM attempts WHERE quiz_code=?", (code,)).fetchone()["n"]
-    cut = cutoff_score(code)
-    txt = f"📊 {quiz['title']} — Result\n👥 Participants: {total}\n"
-    txt += f"🎯 Top 10 Cutoff: {cut if cut is not None else 'ଏପର୍ଯ୍ୟନ୍ତ Result ନାହିଁ'}\n\n"
-    if rows:
-        txt += "🏆 Top 10:\n"
-        for i, r in enumerate(rows, 1):
-            txt += f"{i}. {r['display_name']} — {r['score']}/{r['total']} — {r['elapsed_seconds']} sec\n"
-    else:
-        txt += "ଏପର୍ଯ୍ୟନ୍ତ କେହି Quiz ଦେଇନାହାନ୍ତି।"
-    await update.effective_message.reply_text(txt)
+    if q['closed']:
+        await update.effective_message.reply_text('ଏହି quiz ବନ୍ଦ ହୋଇସାରିଛି।')
+        return
+    PENDING[update.effective_user.id] = ('one', code)
+    await update.effective_message.reply_text(
+        'ଏବେ ଗୋଟିଏ ଲାଇନ୍‌ରେ ପ୍ରଶ୍ନ ପଠାଅ:\n\n'
+        'ପ୍ରଶ୍ନ | ଅପ୍ସନ A | ଅପ୍ସନ B | ଅପ୍ସନ C | ଅପ୍ସନ D | ସଠିକ୍ ଅପ୍ସନ ନମ୍ବର (1-4)\n\n'
+        'ଉଦାହରଣ:\nଭାରତର ରାଜଧାନୀ କଣ? | ମୁମ୍ବାଇ | ନୂଆଦିଲ୍ଲୀ | କୋଲକାତା | ଚେନ୍ନାଇ | 2')
 
-async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await results(update, context)
+async def importq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /import CODE')
+        return
+    code = context.args[0].upper()
+    q = quiz_row(code)
+    if not q or q['owner_id'] != update.effective_user.id or q['closed']:
+        await update.effective_message.reply_text('Quiz code ଭୁଲ୍, ଏହା ତୁମର ନୁହେଁ, କିମ୍ବା quiz ବନ୍ଦ।')
+        return
+    PENDING[update.effective_user.id] = ('bulk', code)
+    await update.effective_message.reply_text(
+        'ଏବେ ପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନକୁ ଅଲଗା ଲାଇନ୍‌ରେ ପଠାଅ।\n'
+        'ଫର୍ମାଟ୍: ପ୍ରଶ୍ନ | A | B | C | D | ସଠିକ୍ ନମ୍ବର (1-4)\n\n'
+        'ପ୍ରତ୍ୟେକ ଲାଇନ୍‌ରେ ୬ଟି ଭାଗ ରହିବ।')
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in PENDING:
+        return
+    mode, code = PENDING[uid]
+    text = update.effective_message.text.strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    parsed = []
+    try:
+        for line in lines:
+            parsed.append(parse_question_line(line))
+    except ValueError as e:
+        await update.effective_message.reply_text(f'ଫର୍ମାଟ୍ ଠିକ୍ ନୁହେଁ।\n{e}')
+        return
+    with conn() as c:
+        quiz = c.execute('SELECT * FROM quizzes WHERE code=?', (code,)).fetchone()
+        if not quiz or quiz['owner_id'] != uid or quiz['closed']:
+            PENDING.pop(uid, None)
+            await update.effective_message.reply_text('Quiz ମିଳୁନାହିଁ କିମ୍ବା ବନ୍ଦ ହୋଇଛି।')
+            return
+        pos = c.execute('SELECT COALESCE(MAX(pos),0) FROM questions WHERE code=?', (code,)).fetchone()[0]
+        for question, options, correct in parsed:
+            pos += 1
+            c.execute('INSERT INTO questions(code,pos,question,options_json,correct_index) VALUES(?,?,?,?,?)',
+                      (code, pos, question, json.dumps(options, ensure_ascii=False), correct))
+    PENDING.pop(uid, None)
+    await update.effective_message.reply_text(f'ସଫଳ! {len(parsed)}ଟି ପ୍ରଶ୍ନ ଯୋଡ଼ାଗଲା। ଏବେ /link {code} ଲେଖି link ନିଅ।')
+
+async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /link CODE')
+        return
+    code = context.args[0].upper()
+    q = quiz_row(code)
+    if not q or q['owner_id'] != update.effective_user.id:
+        await update.effective_message.reply_text('Quiz code ମିଳୁନାହିଁ କିମ୍ବା ତୁମର ନୁହେଁ।')
+        return
+    questions = get_questions(code)
+    if not questions:
+        await update.effective_message.reply_text(f'ଏପର୍ଯ୍ୟନ୍ତ ପ୍ରଶ୍ନ ନାହିଁ। ପ୍ରଥମେ /addq {code} କିମ୍ବା /import {code} କର।')
+        return
+    me = await context.bot.get_me()
+    url = f'https://t.me/{me.username}?start={code}'
+    await update.effective_message.reply_text(f'Quiz: {q["title"]}\nପ୍ରଶ୍ନ: {len(questions)}\n\nShare କରିବା ପାଇଁ ଏହି link:\n{url}\n\nParticipant link ଖୋଲି Start କଲେ quiz ଆରମ୍ଭ ହେବ।')
+
+async def begin_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
+    user = update.effective_user
+    msg = update.effective_message
+    qz = quiz_row(code)
+    if not qz:
+        await msg.reply_text('ଏହି quiz code ମିଳୁନାହିଁ। ଠିକ୍ link ଖୋଲ।')
+        return
+    if qz['closed']:
+        await msg.reply_text('ଏହି quiz ବନ୍ଦ ହୋଇସାରିଛି।')
+        return
+    questions = get_questions(code)
+    if not questions:
+        await msg.reply_text('ଏହି quiz ରେ ପ୍ରଶ୍ନ ଯୋଡ଼ାଯାଇନାହିଁ।')
+        return
+    if msg.chat.type != 'private':
+        await msg.reply_text('Quiz ଦେବା ପାଇଁ ଏହି bot କୁ private chat ରେ ଖୋଲ।')
+        return
+    with conn() as c:
+        attempt = c.execute('SELECT * FROM attempts WHERE code=? AND user_id=?', (code, user.id)).fetchone()
+        if attempt:
+            if attempt['finished']:
+                await msg.reply_text(f'ତୁମେ ଏହି quiz ଦେଇସାରିଛ। Score: {attempt["score"]}/{attempt["total"]}')
+            else:
+                await msg.reply_text('ତୁମର quiz attempt ପୂର୍ବରୁ ଆରମ୍ଭ ହୋଇଛି। ଦୟାକରି ପୂର୍ବ ପ୍ରଶ୍ନର ଉତ୍ତର ଦିଅ।')
+            return
+        display = user.full_name[:100]
+        c.execute('INSERT INTO attempts(code,user_id,display_name,score,total,current_pos,started_at) VALUES(?,?,?,?,?,?,?)',
+                  (code, user.id, display, 0, len(questions), 0, time.time()))
+    await msg.reply_text(f'ଆରମ୍ଭ ହେଲା: {qz["title"]}\nମୋଟ ପ୍ରଶ୍ନ: {len(questions)}\nପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନର ଗୋଟିଏ ଉତ୍ତର ବାଛ।')
+    await send_question(context, code, user.id, 0, msg.chat_id)
+
+async def send_question(context: ContextTypes.DEFAULT_TYPE, code: str, user_id: int, pos: int, chat_id: int):
+    questions = get_questions(code)
+    if pos >= len(questions):
+        with conn() as c:
+            c.execute('UPDATE attempts SET finished=1, finished_at=? WHERE code=? AND user_id=?', (time.time(), code, user_id))
+            a = c.execute('SELECT * FROM attempts WHERE code=? AND user_id=?', (code, user_id)).fetchone()
+        await context.bot.send_message(chat_id, f'Quiz ସମାପ୍ତ! ତୁମ Score: {a["score"]}/{a["total"]}\nLeaderboard ପାଇଁ quiz owner କୁ /leaderboard {code} ପଚାର।')
+        return
+    q = questions[pos]
+    opts = json.loads(q['options_json'])
+    sent = await context.bot.send_poll(chat_id=chat_id, question=f'Q{pos+1}. {q["question"]}', options=opts,
+        type=Poll.QUIZ, correct_option_id=q['correct_index'], is_anonymous=False, allows_multiple_answers=False)
+    with conn() as c:
+        c.execute('INSERT OR REPLACE INTO polls(poll_id,code,pos,user_id) VALUES(?,?,?,?)', (sent.poll.id, code, pos, user_id))
+        c.execute('UPDATE attempts SET current_pos=? WHERE code=? AND user_id=?', (pos, code, user_id))
+    POLL_CACHE[sent.poll.id] = (code, pos, user_id)
+
+async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pa = update.poll_answer
+    if not pa or not pa.user or not pa.option_ids:
+        return
+    with conn() as c:
+        p = c.execute('SELECT * FROM polls WHERE poll_id=?', (pa.poll_id,)).fetchone()
+        if not p or p['user_id'] != pa.user.id:
+            return
+        code, pos, uid = p['code'], p['pos'], p['user_id']
+        q = c.execute('SELECT correct_index FROM questions WHERE code=? AND pos=?', (code, pos+1)).fetchone()
+        a = c.execute('SELECT * FROM attempts WHERE code=? AND user_id=?', (code, uid)).fetchone()
+        if not q or not a or a['finished'] or a['current_pos'] != pos:
+            return
+        if pa.option_ids[0] == q['correct_index']:
+            c.execute('UPDATE attempts SET score=score+1 WHERE code=? AND user_id=?', (code, uid))
+        c.execute('DELETE FROM polls WHERE poll_id=?', (pa.poll_id,))
+        next_pos = pos + 1
+    await send_question(context, code, uid, next_pos, uid)
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /leaderboard CODE')
+        return
+    code = context.args[0].upper()
+    q = quiz_row(code)
+    if not q or q['owner_id'] != update.effective_user.id:
+        await update.effective_message.reply_text('Quiz code ମିଳୁନାହିଁ କିମ୍ବା ଏହା ତୁମର ନୁହେଁ।')
+        return
+    with conn() as c:
+        rows = c.execute('SELECT display_name,score,total,finished_at,started_at FROM attempts WHERE code=? AND finished=1 ORDER BY score DESC, (finished_at-started_at) ASC, finished_at ASC LIMIT 10', (code,)).fetchall()
+        total_people = c.execute('SELECT COUNT(*) FROM attempts WHERE code=? AND finished=1', (code,)).fetchone()[0]
+    if not rows:
+        await update.effective_message.reply_text('ଏପର୍ଯ୍ୟନ୍ତ କେହି quiz ସମାପ୍ତ କରିନାହାନ୍ତି।')
+        return
+    cutoff = rows[9]['score'] if len(rows) >= 10 else 'Top 10 ପୂରଣ ହୋଇନାହିଁ'
+    lines = [f'🏆 {q["title"]} — Top 10', '']
+    for i, r in enumerate(rows, 1):
+        lines.append(f'{i}. {r["display_name"]} — {r["score"]}/{r["total"]}')
+    lines += ['', f'Completed participants: {total_people}', f'Cutoff (10th rank score): {cutoff}']
+    await update.effective_message.reply_text('\n'.join(lines))
+
+async def close_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text('ଏଭଳି ଲେଖ: /close CODE')
+        return
+    code = context.args[0].upper()
+    q = quiz_row(code)
+    if not q or q['owner_id'] != update.effective_user.id:
+        await update.effective_message.reply_text('Quiz code ମିଳୁନାହିଁ କିମ୍ବା ତୁମର ନୁହେଁ।')
+        return
+    with conn() as c:
+        c.execute('UPDATE quizzes SET closed=1 WHERE code=?', (code,))
+    await update.effective_message.reply_text('Quiz ବନ୍ଦ ହେଲା। ଏବେ ଫଳାଫଳ: /leaderboard ' + code)
+    # If fewer than 10 completed, cutoff is displayed as not filled.
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_message.reply_text("ବାତିଲ ହେଲା। /start କରି ପୁଣି ଆରମ୍ଭ କର।")
-    return ConversationHandler.END
+    PENDING.pop(update.effective_user.id, None)
+    await update.effective_message.reply_text('ଠିକ୍ ଅଛି, ଚାଲୁଥିବା input cancel ହେଲା।')
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("newquiz", newquiz), CommandHandler("addq", addq)],
-        states={
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_received)],
-            QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, question_received)],
-            OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, options_received)],
-            ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", lambda u,c: help_command(u,c)))
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("publishquiz", publishquiz))
-    app.add_handler(CommandHandler("results", results))
-    app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, copy_paste_handler))
-    app.run_polling()
+async def post_init(application: Application):
+    if not PUBLIC_URL:
+        log.warning('RENDER_EXTERNAL_URL not set. Webhook will not be configured.')
+        return
+    webhook_path = WEBHOOK_SECRET
+    await application.bot.set_webhook(url=f'{PUBLIC_URL}/{webhook_path}', secret_token=WEBHOOK_SECRET,
+                                      allowed_updates=['message', 'poll_answer', 'callback_query'])
+    log.info('Webhook configured.')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Manual: /newquiz → title → question → options → answer → /addq → /publishquiz\n"
-        "Copy-Paste: Q1., A), B), C), D), Answer: B format ରେ ପଠାଅ।\n"
-        "Leaderboard: /leaderboard CODE | Results: /results CODE\n"
-        "Automatic score collection + shareable link ଏହି starter code ରେ web quiz backend ପରବର୍ତ୍ତୀ ପଦକ୍ଷେପରେ ଯୋଡ଼ିବାକୁ ପଡ଼ିବ।"
-    )
+async def main():
+    init_db()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CommandHandler('newquiz', newquiz))
+    app.add_handler(CommandHandler('addq', addq))
+    app.add_handler(CommandHandler('import', importq))
+    app.add_handler(CommandHandler('link', link_cmd))
+    app.add_handler(CommandHandler('leaderboard', leaderboard))
+    app.add_handler(CommandHandler('close', close_quiz))
+    app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(PollAnswerHandler(poll_answer))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Render's webhook mode binds an HTTP server and receives Telegram updates.
+    await app.initialize()
+    await app.start()
+    await app.updater.start_webhook(listen='0.0.0.0', port=PORT, url_path=WEBHOOK_SECRET,
+        webhook_url=f'{PUBLIC_URL}/{WEBHOOK_SECRET}' if PUBLIC_URL else None,
+        secret_token=WEBHOOK_SECRET if PUBLIC_URL else None,
+        allowed_updates=['message', 'poll_answer', 'callback_query'])
+    log.info('Bot started on port %s', PORT)
+    import asyncio
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
