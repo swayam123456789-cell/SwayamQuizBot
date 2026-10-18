@@ -1,469 +1,297 @@
-import os
-import re
-import uuid
-import random
-import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-
+import os, re, json, sqlite3, asyncio, time, html, logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
-)
+from telegram.constants import ChatType
+from telegram.error import TelegramError, BadRequest
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("swayamquizbot")
-
-TOKEN = os.getenv("BOT_TOKEN")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+TOKEN = os.getenv('BOT_TOKEN', '').strip()
+DB_PATH = os.getenv('DB_PATH', 'swayam_quiz.db')
+DEFAULT_TIMER = int(os.getenv('DEFAULT_TIMER', '15'))
 if not TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN. Add it in Render > Environment.")
+    raise RuntimeError('Missing BOT_TOKEN. Add it in Render > Environment.')
 
-TIMER_CHOICES = {
-    "10": 10, "15": 15, "30": 30, "45": 45,
-    "1m": 60, "2m": 120, "3m": 180, "4m": 240, "5m": 300,
-}
-DEFAULT_TIMER = 15
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute('PRAGMA foreign_keys=ON')
+db.executescript('''
+CREATE TABLE IF NOT EXISTS quizzes(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, title TEXT NOT NULL, topic TEXT DEFAULT '', intro TEXT DEFAULT '', funny TEXT DEFAULT '', timer INTEGER NOT NULL, questions_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS groups_seen(chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner_id INTEGER NOT NULL, seen_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS active_quizzes(chat_id INTEGER PRIMARY KEY, quiz_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, qindex INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'running', message_id INTEGER);
+CREATE TABLE IF NOT EXISTS scores(chat_id INTEGER NOT NULL, quiz_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, answered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chat_id,quiz_id,user_id));
+''')
+db.commit()
+runtime = {}
 
-@dataclass
-class Question:
-    english: str
-    odia: str
-    options: Dict[str, str]
-    correct: str
 
-@dataclass
-class Quiz:
-    quiz_id: str
-    title: str
-    questions: List[Question]
-    chat_id: int
-    owner_id: int
-    timer: int = DEFAULT_TIMER
-    shuffle_questions: bool = False
-    shuffle_options: bool = False
-    index: int = 0
-    paused: bool = False
-    stopped: bool = False
-    scores: Dict[int, int] = field(default_factory=dict)
-    names: Dict[int, str] = field(default_factory=dict)
-    answered: set = field(default_factory=set)
-    current_message_id: Optional[int] = None
-    timer_job: object = None
+def parse_txt(raw):
+    lines = [x.strip() for x in raw.replace('\r', '').split('\n')]
+    result, cur = [], None
+    def finish():
+        nonlocal cur
+        if not cur: return
+        opts = cur['options']; ans = cur.get('answer')
+        if len(opts) >= 2 and cur['question']:
+            for i, opt in enumerate(opts):
+                if opt.startswith('*'):
+                    opts[i] = opt.lstrip('* ').strip()
+                    if ans is None: ans = i
+            cur['options'] = [o.lstrip('* ').strip() for o in opts]
+            if ans is not None and 0 <= ans < len(opts): cur['answer'] = ans
+            else: cur['answer'] = None
+            result.append(cur)
+        cur = None
+    for line in lines:
+        if not line: continue
+        if re.match(r'^(?:Q(?:uestion)?\s*)?\d{1,3}\s*[).:\-]', line, re.I):
+            finish()
+            cur = {'question': re.sub(r'^(?:Q(?:uestion)?\s*)?\d{1,3}\s*[).:\-]\s*', '', line, flags=re.I), 'options': [], 'answer': None}
+            continue
+        am = re.match(r'^(?:correct\s*)?(?:answer|ans)\s*[:\-.)]\s*([A-Da-d]|[1-4])\b', line, re.I)
+        if am and cur:
+            a = am.group(1).upper(); cur['answer'] = ord(a)-65 if a in 'ABCD' else int(a)-1; continue
+        om = re.match(r'^[\[(]?([A-Da-d])[\]).:\-]\s*(.+)$', line)
+        if om and cur:
+            val = om.group(2).strip()
+            if val.startswith('*'):
+                cur['answer'] = ord(om.group(1).upper())-65
+            cur['options'].append(val)
+            continue
+        if cur and not cur['options']:
+            cur['question'] += ' ' + line
+    finish()
+    return result[:200]
 
-quizzes_by_chat: Dict[int, Quiz] = {}
-quizzes_by_id: Dict[str, Quiz] = {}
-# Published quiz definitions are held in memory; redeploy/restart clears them.
-published_quizzes: Dict[str, Quiz] = {}
-bot_username: Optional[str] = None
 
-def parse_mcqs(text: str) -> List[Question]:
-    """English line first; optional Odia line below. Each option may have a second translation line."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    starts = list(re.finditer(r"(?im)^\s*Q(?:uestion)?\s*\d+\s*[.):\-]\s*", text))
-    if not starts:
-        raise ValueError("Each question must begin with Q1. or Q2.")
-    chunks = [
-        text[m.start():(starts[i + 1].start() if i + 1 < len(starts) else len(text))].strip()
-        for i, m in enumerate(starts)
-    ]
-    result = []
-    for chunk in chunks:
-        lines = [line.strip() for line in chunk.split("\n")]
-        q_en = re.sub(r"(?i)^\s*Q(?:uestion)?\s*\d+\s*[.):\-]\s*", "", lines[0]).strip()
-        if not q_en:
-            raise ValueError("A question has no text.")
-        i = 1
-        q_odia = ""
-        if i < len(lines) and lines[i] and not re.match(r"^[A-Da-d]\s*[.):\-]", lines[i]) and not re.match(r"(?i)^(correct\s*answer|answer)\s*:", lines[i]):
-            q_odia = lines[i]
-            i += 1
-        raw_options, current, answer = {}, None, None
-        while i < len(lines):
-            line = lines[i]
-            ans = re.match(r"(?i)^(?:correct\s*answer|answer)\s*:\s*([A-D])\s*$", line)
-            opt = re.match(r"^([A-Da-d])\s*[.):\-]\s*(.*)$", line)
-            if ans:
-                answer = ans.group(1).upper()
-                current = None
-            elif opt:
-                current = opt.group(1).upper()
-                raw_options[current] = [opt.group(2).strip()]
-            elif current and line:
-                raw_options[current].append(line)
-            elif line:
-                raise ValueError(f"Could not understand line in question '{q_en}': {line}")
-            i += 1
-        if set(raw_options) != set("ABCD"):
-            raise ValueError(f"Question '{q_en}' must have options A, B, C and D.")
-        if not answer:
-            raise ValueError(f"Question '{q_en}' needs 'Correct Answer: B'.")
-        opts = {}
-        for key in "ABCD":
-            vals = raw_options[key]
-            opts[key] = vals[0] + (("\n" + vals[1]) if len(vals) > 1 else "")
-        result.append(Question(q_en, q_odia, opts, answer))
-    if not result:
-        raise ValueError("No valid questions found.")
-    return result
+def quiz_for(qid, owner=None):
+    if owner is None: return db.execute('SELECT * FROM quizzes WHERE id=?', (qid,)).fetchone()
+    return db.execute('SELECT * FROM quizzes WHERE id=? AND owner_id=?', (qid, owner)).fetchone()
 
-def parse_duration(value: str) -> int:
-    key = value.lower().strip()
-    if key in TIMER_CHOICES:
-        return TIMER_CHOICES[key]
-    if key.isdigit() and int(key) in TIMER_CHOICES.values():
-        return int(key)
-    raise ValueError("Timer must be 10, 15, 30, 45 seconds or 1m, 2m, 3m, 4m, 5m.")
-
-def format_duration(seconds: int) -> str:
-    return f"{seconds} sec" if seconds < 60 else f"{seconds // 60} min"
-
-def render_question(q: Question, idx: int, total: int, quiz: Quiz):
-    body = f"📝 {quiz.title}\nQuestion {idx + 1}/{total}\n\n{q.english}"
-    if q.odia:
-        body += "\n" + q.odia
-    body += f"\n\n⏱ Time: {format_duration(quiz.timer)}"
-    keys = list("ABCD")
-    if quiz.shuffle_options:
-        random.shuffle(keys)
-    keyboard = [[InlineKeyboardButton(q.options[k], callback_data=f"ans|{quiz.quiz_id}|{idx}|{k}")]
-                for k in keys]
-    return body, InlineKeyboardMarkup(keyboard)
-
-async def cancel_timer(quiz: Quiz):
-    if quiz.timer_job:
-        quiz.timer_job.schedule_removal()
-        quiz.timer_job = None
-
-async def send_current(quiz: Quiz, context: ContextTypes.DEFAULT_TYPE):
-    if quiz.stopped:
-        return
-    if quiz.paused:
-        return
-    if quiz.index >= len(quiz.questions):
-        await finish_quiz(quiz, context, "Quiz completed")
-        return
-    await cancel_timer(quiz)
-    q = quiz.questions[quiz.index]
-    body, markup = render_question(q, quiz.index, len(quiz.questions), quiz)
-    msg = await context.bot.send_message(quiz.chat_id, body, reply_markup=markup)
-    quiz.current_message_id = msg.message_id
-    quiz.timer_job = context.job_queue.run_once(
-        timer_expired, when=quiz.timer,
-        data={"quiz_id": quiz.quiz_id, "index": quiz.index},
-        name=f"quiz-{quiz.quiz_id}",
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE: return
+    await update.message.reply_text(
+        '👋 ନମସ୍କାର! Swayam Quiz Bot କୁ ସ୍ୱାଗତ।\n\n'
+        '1. ଏହି Private Chat ରେ .txt MCQ ଫାଇଲ୍ ପଠାନ୍ତୁ।\n'
+        '2. Quiz ର ନାମ, Topic, Intro, Funny Message ଓ Timer ଦିଅନ୍ତୁ।\n'
+        '3. /myquizzes ଦେଇ Quiz ବାଛି Group ରେ Share କରନ୍ତୁ।\n\n'
+        'Group ରେ Bot କୁ Admin କରି /register ପଠାନ୍ତୁ।\n'
+        '/myquizzes — Saved Quiz\n/groups — Registered Groups\n/help — ସହାୟତା'
     )
 
-async def timer_expired(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    quiz = quizzes_by_id.get(data["quiz_id"])
-    if not quiz or quiz.stopped or quiz.paused or quiz.index != data["index"]:
-        return
-    try:
-        if quiz.current_message_id:
-            await context.bot.edit_message_reply_markup(
-                chat_id=quiz.chat_id, message_id=quiz.current_message_id, reply_markup=None
-            )
-    except Exception:
-        pass
-    quiz.index += 1
-    await send_current(quiz, context)
-
-async def finish_quiz(quiz: Quiz, context: ContextTypes.DEFAULT_TYPE, reason: str):
-    await cancel_timer(quiz)
-    quiz.stopped = True
-    lines = [f"🏁 {reason}: {quiz.title}", "🏆 Top 10 Results", ""]
-    ranking = sorted(quiz.scores.items(), key=lambda x: (-x[1], quiz.names.get(x[0], "").casefold()))
-    if not ranking:
-        lines.append("No answers recorded.")
-    for rank, (uid, score) in enumerate(ranking[:10], 1):
-        lines.append(f"{rank}. {quiz.names.get(uid, 'Participant')} — {score}/{len(quiz.questions)}")
-    try:
-        await context.bot.send_message(quiz.chat_id, "\n".join(lines))
-    except Exception:
-        log.exception("Could not post results")
-    quizzes_by_chat.pop(quiz.chat_id, None)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /start <quiz_id> lets a user open a published quiz in a private chat.
-    if context.args:
-        quiz_id = context.args[0]
-        source = published_quizzes.get(quiz_id)
-        if source:
-            user_chat = update.effective_chat.id
-            clone = Quiz(
-                quiz_id=uuid.uuid4().hex[:8], title=source.title,
-                questions=list(source.questions), chat_id=user_chat,
-                owner_id=update.effective_user.id, timer=source.timer,
-                shuffle_questions=source.shuffle_questions,
-                shuffle_options=source.shuffle_options,
-            )
-            quizzes_by_chat[user_chat] = clone
-            quizzes_by_id[clone.quiz_id] = clone
-            await update.effective_message.reply_text(f"Quiz opened: {clone.title}\nStarting now.")
-            await send_current(clone, context)
-            return
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Welcome to SwayamQuizbot!\n\n"
-        "Upload a .txt MCQ file here or post it in a channel where I am admin.\n"
-        "The quiz starts automatically after the file is parsed.\n\n"
-        "Commands: /settings, /timer 15, /shuffle all, /shuffle questions, "
-        "/shuffle options, /pause, /resume, /next, /leaderboard, /share, /stop\n"
-        "Default timer: 15 seconds."
+        'TXT format:\nQ1. Question?\nA) Option 1\nB) Option 2\nC) Option 3\nD) Option 4\nAnswer: B\n\n'
+        'Quiz ବନାଇବା: Private Chat ରେ .txt ପଠାନ୍ତୁ।\n'
+        'Group setup: Bot କୁ Admin କରନ୍ତୁ, Group ରେ /register ପଠାନ୍ତୁ।\n'
+        'Quiz share: Private Chat ରେ /myquizzes ବ୍ୟବହାର କରନ୍ତୁ।\n'
+        'Group Admin /stopquiz ଦେଇ Quiz ବନ୍ଦ କରିପାରିବେ।\n'
+        'Score ପାଇଁ ପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନରେ Answer: B ପରି answer key ରଖନ୍ତୁ.'
     )
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    doc = msg.document if msg else None
-    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".txt"):
-        return
+async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text('ଏହି command Group ଭିତରେ ଦିଅନ୍ତୁ।'); return
+    admins = await context.bot.get_chat_administrators(chat.id)
+    if not any(a.user.id == user.id for a in admins):
+        await update.effective_message.reply_text('କେବଳ Group Admin register କରିପାରିବେ।'); return
+    me = await context.bot.get_chat_member(chat.id, context.bot.id)
+    if me.status not in ('administrator', 'creator'):
+        await update.effective_message.reply_text('ପ୍ରଥମେ Bot କୁ Group Admin କରନ୍ତୁ।'); return
+    db.execute('INSERT INTO groups_seen VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,owner_id=excluded.owner_id,seen_at=excluded.seen_at', (chat.id, chat.title or 'Telegram Group', user.id, int(time.time())))
+    db.commit()
+    await update.effective_message.reply_text('✅ Group register ହେଲା। ଏବେ Private Chat ରେ /myquizzes ଦେଇ Quiz Share କରନ୍ତୁ।')
+
+async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE: return
+    doc = update.message.document
+    if not doc or not (doc.file_name or '').lower().endswith('.txt'): return
     try:
         tgfile = await context.bot.get_file(doc.file_id)
-        content = bytes(await tgfile.download_as_bytearray()).decode("utf-8-sig")
-        questions = parse_mcqs(content)
-    except Exception as exc:
-        await msg.reply_text(f"❌ Could not load quiz file:\n{exc}")
-        return
-    chat = update.effective_chat
-    if chat.id in quizzes_by_chat and not quizzes_by_chat[chat.id].stopped:
-        await msg.reply_text("There is already an active quiz in this chat. Use /stop first.")
-        return
-
-    title = os.path.splitext(doc.file_name)[0].replace("_", " ").strip() or "Practice Quiz"
-    timer = DEFAULT_TIMER
-    # Apply optional per-chat settings saved in bot_data.
-    settings = context.application.bot_data.setdefault("settings", {}).get(chat.id, {})
-    timer = settings.get("timer", DEFAULT_TIMER)
-    shuffle_questions = settings.get("shuffle_questions", False)
-    shuffle_options = settings.get("shuffle_options", False)
-    if shuffle_questions:
-        random.shuffle(questions)
-    quiz = Quiz(
-        quiz_id=uuid.uuid4().hex[:8], title=title, questions=questions,
-        chat_id=chat.id, owner_id=update.effective_user.id if update.effective_user else 0,
-        timer=timer, shuffle_questions=shuffle_questions, shuffle_options=shuffle_options,
-    )
-    quizzes_by_chat[chat.id] = quiz
-    quizzes_by_id[quiz.quiz_id] = quiz
-    await msg.reply_text(
-        f"✅ Quiz created: {title}\n{len(questions)} questions · ⏱ {format_duration(timer)}\n"
-        "Starting now. Use /pause, /resume or /stop to control it."
-    )
-    await send_current(quiz, context)
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("10 sec", callback_data="cfg|timer|10"),
-         InlineKeyboardButton("15 sec", callback_data="cfg|timer|15"),
-         InlineKeyboardButton("30 sec", callback_data="cfg|timer|30")],
-        [InlineKeyboardButton("45 sec", callback_data="cfg|timer|45"),
-         InlineKeyboardButton("1 min", callback_data="cfg|timer|1m"),
-         InlineKeyboardButton("2 min", callback_data="cfg|timer|2m")],
-        [InlineKeyboardButton("3 min", callback_data="cfg|timer|3m"),
-         InlineKeyboardButton("4 min", callback_data="cfg|timer|4m"),
-         InlineKeyboardButton("5 min", callback_data="cfg|timer|5m")],
-        [InlineKeyboardButton("Shuffle all", callback_data="cfg|shuffle|all"),
-         InlineKeyboardButton("No shuffle", callback_data="cfg|shuffle|none")],
-        [InlineKeyboardButton("Only questions", callback_data="cfg|shuffle|questions"),
-         InlineKeyboardButton("Only answers", callback_data="cfg|shuffle|options")],
-    ]
-    await update.effective_message.reply_text(
-        "Quiz settings\nChoose the default timer and shuffle mode before uploading a .txt file.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, kind, value = query.data.split("|")
-    except ValueError:
-        return
-    chat_id = query.message.chat.id
-    settings = context.application.bot_data.setdefault("settings", {}).setdefault(chat_id, {})
-    if kind == "timer":
-        settings["timer"] = parse_duration(value)
-        await query.edit_message_text(f"Default timer set to {format_duration(settings['timer'])}.")
-    elif kind == "shuffle":
-        settings["shuffle_questions"] = value in ("all", "questions")
-        settings["shuffle_options"] = value in ("all", "options")
-        if value == "none":
-            settings["shuffle_questions"] = settings["shuffle_options"] = False
-        await query.edit_message_text(
-            f"Shuffle settings saved: questions={'ON' if settings['shuffle_questions'] else 'OFF'}, "
-            f"options={'ON' if settings['shuffle_options'] else 'OFF'}."
-        )
-
-async def timer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Use /timer 15 (or 10, 30, 45, 1m, 2m, 3m, 4m, 5m).")
-        return
-    try:
-        seconds = parse_duration(context.args[0])
-    except ValueError as exc:
-        await update.effective_message.reply_text(str(exc))
-        return
-    settings = context.application.bot_data.setdefault("settings", {}).setdefault(update.effective_chat.id, {})
-    settings["timer"] = seconds
-    await update.effective_message.reply_text(f"Default timer set to {format_duration(seconds)} for the next quiz.")
-
-async def shuffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Use /shuffle all, /shuffle questions, /shuffle options, or /shuffle off.")
-        return
-    value = context.args[0].lower()
-    settings = context.application.bot_data.setdefault("settings", {}).setdefault(update.effective_chat.id, {})
-    if value == "all":
-        settings["shuffle_questions"] = settings["shuffle_options"] = True
-    elif value == "questions":
-        settings["shuffle_questions"] = True
-    elif value == "options":
-        settings["shuffle_options"] = True
-    elif value in ("off", "none"):
-        settings["shuffle_questions"] = settings["shuffle_options"] = False
-    else:
-        await update.effective_message.reply_text("Choose all, questions, options, or off.")
-        return
-    await update.effective_message.reply_text(
-        f"Shuffle saved: questions={'ON' if settings.get('shuffle_questions') else 'OFF'}, "
-        f"options={'ON' if settings.get('shuffle_options') else 'OFF'}."
-    )
-
-async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz or quiz.stopped:
-        await update.effective_message.reply_text("No active quiz.")
-        return
-    quiz.paused = True
-    await cancel_timer(quiz)
-    await update.effective_message.reply_text("⏸ Quiz paused. Use /resume to continue.")
-
-async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz or quiz.stopped:
-        await update.effective_message.reply_text("No active quiz.")
-        return
-    if not quiz.paused:
-        await update.effective_message.reply_text("Quiz is already running.")
-        return
-    quiz.paused = False
-    await update.effective_message.reply_text("▶️ Quiz resumed.")
-    await send_current(quiz, context)
-
-async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz or quiz.stopped:
-        await update.effective_message.reply_text("No active quiz.")
-        return
-    if quiz.paused:
-        await update.effective_message.reply_text("Quiz is paused. Use /resume first.")
-        return
-    await cancel_timer(quiz)
-    try:
-        if quiz.current_message_id:
-            await context.bot.edit_message_reply_markup(
-                chat_id=quiz.chat_id, message_id=quiz.current_message_id, reply_markup=None
-            )
+        raw = (await tgfile.download_as_bytearray()).decode('utf-8-sig', errors='replace')
     except Exception:
-        pass
-    quiz.index += 1
-    await send_current(quiz, context)
+        await update.message.reply_text('ଫାଇଲ୍ ପଢ଼ିପାରିଲି ନାହିଁ। ପୁଣିଥରେ .txt ପଠାନ୍ତୁ।'); return
+    qs = parse_txt(raw)
+    if not qs:
+        await update.message.reply_text('MCQ ମିଳିଲା ନାହିଁ। Format ଦେଖନ୍ତୁ /help'); return
+    context.user_data['draft'] = {'questions': qs, 'step': 'title'}
+    await update.message.reply_text(f'✅ {len(qs)}ଟି ପ୍ରଶ୍ନ ମିଳିଲା।\nQuiz ର ନାମ ପଠାନ୍ତୁ।\nବାତିଲ୍ କରିବାକୁ /cancel')
 
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz:
-        await update.effective_message.reply_text("No quiz data in this chat.")
-        return
-    ranking = sorted(quiz.scores.items(), key=lambda x: (-x[1], quiz.names.get(x[0], "").casefold()))
-    lines = ["🏆 Top 10 Leaderboard"]
-    if not ranking:
-        lines.append("No answers recorded yet.")
-    for rank, (uid, score) in enumerate(ranking[:10], 1):
-        lines.append(f"{rank}. {quiz.names.get(uid, 'Participant')} — {score}/{len(quiz.questions)}")
-    await update.effective_message.reply_text("\n".join(lines))
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('draft', None)
+    await update.effective_message.reply_text('Draft ବାତିଲ୍ ହେଲା।')
 
-async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz:
-        await update.effective_message.reply_text("Upload a .txt quiz file first, then use /share.")
-        return
-    published_quizzes[quiz.quiz_id] = quiz
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start={quiz.quiz_id}"
-    await update.effective_message.reply_text(
-        f"🔗 Share this quiz:\n{link}\n\nPeople can open the link in a private chat with the bot."
-    )
+async def draft_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE: return
+    d = context.user_data.get('draft')
+    if not d: return
+    text = (update.message.text or '').strip()
+    if text.lower() in ('-', 'skip', 'none'): text = ''
+    step = d['step']
+    if step == 'title': d['title'] = text[:90] or 'My Quiz'; d['step'] = 'topic'; await update.message.reply_text('📚 Topic ପଠାନ୍ତୁ (ନଥିଲେ -)।')
+    elif step == 'topic': d['topic'] = text[:160]; d['step'] = 'intro'; await update.message.reply_text('🎤 Quiz start Intro ପଠାନ୍ତୁ (ନଥିଲେ -)।')
+    elif step == 'intro': d['intro'] = text[:500]; d['step'] = 'funny'; await update.message.reply_text('😂 Quiz ସରିଲେ ଦେଖାଇବା Funny Message ପଠାନ୍ତୁ (ନଥିଲେ -)।')
+    elif step == 'funny': d['funny'] = text[:500]; d['step'] = 'timer'; await update.message.reply_text('⏱️ ପ୍ରତି ପ୍ରଶ୍ନ Timer 5–120 seconds ମଧ୍ୟରେ ଦିଅନ୍ତୁ।')
+    elif step == 'timer':
+        try: timer = int(text)
+        except ValueError: await update.message.reply_text('5 ରୁ 120 ମଧ୍ୟରେ ସଂଖ୍ୟା ଦିଅନ୍ତୁ।'); return
+        if not 5 <= timer <= 120: await update.message.reply_text('5 ରୁ 120 ମଧ୍ୟରେ Timer ଦିଅନ୍ତୁ।'); return
+        cur = db.execute('INSERT INTO quizzes(owner_id,title,topic,intro,funny,timer,questions_json,created_at) VALUES(?,?,?,?,?,?,?,?)', (update.effective_user.id,d['title'],d['topic'],d['intro'],d['funny'],timer,json.dumps(d['questions'],ensure_ascii=False),int(time.time())))
+        db.commit(); qid = cur.lastrowid; count = len(d['questions']); title = d['title']; context.user_data.pop('draft',None)
+        await update.message.reply_text(f'💾 Quiz Save ହୋଇଗଲା!\n\n🆔 ID: {qid}\n📚 {title}\n📝 {count} ପ୍ରଶ୍ନ\n⏱️ {timer} seconds\n\nGroup ରେ ଦେଖାଯାଇନାହିଁ। /myquizzes ଦେଇ Share କରନ୍ତୁ।')
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = quizzes_by_chat.get(update.effective_chat.id)
-    if not quiz:
-        await update.effective_message.reply_text("No active quiz.")
-        return
-    await finish_quiz(quiz, context, "Quiz stopped")
+async def myquizzes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE: await update.effective_message.reply_text('Private Chat ରେ ବ୍ୟବହାର କରନ୍ତୁ।'); return
+    rows = db.execute('SELECT * FROM quizzes WHERE owner_id=? ORDER BY id DESC LIMIT 30', (update.effective_user.id,)).fetchall()
+    if not rows: await update.effective_message.reply_text('Quiz Save ହୋଇନାହିଁ। ପ୍ରଥମେ .txt file ପଠାନ୍ତୁ।'); return
+    kb = [[InlineKeyboardButton(f"📚 {r['title']} (ID {r['id']})", callback_data=f"quiz:{r['id']}")] for r in rows]
+    await update.effective_message.reply_text('ଆପଣଙ୍କ Saved Quiz ବାଛନ୍ତୁ:', reply_markup=InlineKeyboardMarkup(kb))
 
-async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, quiz_id, idx_s, choice = query.data.split("|")
-        idx = int(idx_s)
-    except Exception:
-        return
-    quiz = quizzes_by_id.get(quiz_id)
-    if not quiz or quiz.stopped or quiz.paused or quiz.index != idx:
-        await query.answer("This question is no longer active.", show_alert=True)
-        return
-    user = query.from_user
-    answer_key = (idx, user.id)
-    if answer_key in quiz.answered:
-        await query.answer("You already answered this question.", show_alert=True)
-        return
-    quiz.answered.add(answer_key)
-    quiz.names[user.id] = user.full_name
-    quiz.scores.setdefault(user.id, 0)
-    if choice == quiz.questions[idx].correct:
-        quiz.scores[user.id] += 1
-        feedback = "✅ Correct!"
-    else:
-        feedback = f"❌ Incorrect. Correct answer: {quiz.questions[idx].correct}"
-    await query.answer(feedback, show_alert=True)
-    # Private practice: move on immediately after the user answers. In groups/channels,
-    # the common timer governs the question for all participants.
-    if query.message and query.message.chat.type == "private":
-        await cancel_timer(quiz)
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute('SELECT * FROM groups_seen WHERE owner_id=? ORDER BY title', (update.effective_user.id,)).fetchall()
+    if not rows: await update.effective_message.reply_text('Group ମିଳିଲା ନାହିଁ। Group ରେ Bot Admin କରି /register ପଠାନ୍ତୁ।'); return
+    await update.effective_message.reply_text('Registered Groups:\n' + '\n'.join('• '+r['title'] for r in rows))
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query; await cq.answer(); data = cq.data or ''; user = cq.from_user
+    if data.startswith('quiz:'):
+        qid = int(data.split(':')[1]); quiz = quiz_for(qid, user.id)
+        if not quiz: await cq.edit_message_text('Quiz ମିଳିଲା ନାହିଁ।'); return
+        groups = db.execute('SELECT * FROM groups_seen WHERE owner_id=? ORDER BY title', (user.id,)).fetchall()
+        if not groups: await cq.edit_message_text('ପ୍ରଥମେ Group ରେ Bot କୁ Admin କରି /register ପଠାନ୍ତୁ।'); return
+        kb = [[InlineKeyboardButton('📣 '+g['title'], callback_data=f"share:{qid}:{g['chat_id']}")] for g in groups]
+        await cq.edit_message_text(f"📚 {quiz['title']}\n📝 {len(json.loads(quiz['questions_json']))} questions\nକେଉଁ Group ରେ Start କରିବେ?", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith('share:'):
+        _, qid_s, chat_s = data.split(':'); qid, chat_id = int(qid_s), int(chat_s); quiz = quiz_for(qid, user.id)
+        if not quiz: await cq.edit_message_text('Quiz ମିଳିଲା ନାହିଁ।'); return
+        active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+        if active: await cq.edit_message_text('ଏହି Group ରେ Quiz ଚାଲିଛି। ପ୍ରଥମେ ସେହି Quiz ସରିବାକୁ ଦିଅନ୍ତୁ।'); return
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        quiz.index += 1
-        await send_current(quiz, context)
+            member = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if member.status not in ('administrator','creator'): await cq.edit_message_text('Bot ଏହି Group ର Admin ନୁହେଁ।'); return
+            await cq.edit_message_text('🚀 Quiz Start କରୁଛି…')
+            await start_quiz(context, chat_id, quiz, user.id)
+        except TelegramError: await cq.edit_message_text('Start ହେଲା ନାହିଁ। Bot Admin permission ଯାଞ୍ଚ କରନ୍ତୁ।')
 
-async def post_init(app: Application):
-    global bot_username
-    me = await app.bot.get_me()
-    bot_username = me.username
-    log.info("Started as @%s", bot_username)
+async def start_quiz(context, chat_id, quiz, owner_id):
+    qs = json.loads(quiz['questions_json'])
+    db.execute('DELETE FROM scores WHERE chat_id=? AND quiz_id=?', (chat_id, quiz['id']))
+    db.execute("INSERT INTO active_quizzes(chat_id,quiz_id,owner_id,qindex,state,message_id) VALUES(?,?,?,0,'running',NULL) ON CONFLICT(chat_id) DO UPDATE SET quiz_id=excluded.quiz_id,owner_id=excluded.owner_id,qindex=0,state='running',message_id=NULL", (chat_id,quiz['id'],owner_id)); db.commit()
+    runtime[chat_id] = {'message_ids': [], 'answered': set(), 'task': None}
+    intro = f"🎯 <b>{html.escape(quiz['title'])}</b>\n"
+    if quiz['topic']: intro += f"📚 <b>Topic:</b> {html.escape(quiz['topic'])}\n"
+    intro += f"📝 <b>Questions:</b> {len(qs)}\n⏱️ <b>Timer:</b> {quiz['timer']} sec\n"
+    if quiz['intro']: intro += '\n' + html.escape(quiz['intro'])
+    intro += '\n\nପ୍ରସ୍ତୁତ ହୁଅନ୍ତୁ! Quiz ଆରମ୍ଭ ହେଉଛି।'
+    msg = await context.bot.send_message(chat_id, intro, parse_mode='HTML'); runtime[chat_id]['message_ids'].append(msg.message_id)
+    await asyncio.sleep(2); await ask_question(context, chat_id)
+
+async def ask_question(context, chat_id):
+    active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+    if not active: return
+    quiz = quiz_for(active['quiz_id']); qs = json.loads(quiz['questions_json']); idx = active['qindex']
+    if idx >= len(qs): await finish_quiz(context, chat_id); return
+    q = qs[idx]; kb = [[InlineKeyboardButton(f"{chr(65+i)}. {opt[:75]}", callback_data=f"ans:{chat_id}:{idx}:{i}")] for i,opt in enumerate(q['options'])]
+    msg = await context.bot.send_message(chat_id, f"❓ <b>Question {idx+1}/{len(qs)}</b>\n\n{html.escape(q['question'])}", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+    runtime[chat_id]['message_ids'].append(msg.message_id); runtime[chat_id]['answered'] = set()
+    db.execute('UPDATE active_quizzes SET message_id=? WHERE chat_id=?', (msg.message_id,chat_id)); db.commit()
+    runtime[chat_id]['task'] = asyncio.create_task(question_timer(context, chat_id, idx, quiz['timer']))
+
+async def question_timer(context, chat_id, idx, seconds):
+    try:
+        await asyncio.sleep(seconds)
+        active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+        if active and active['qindex'] == idx: await next_question(context, chat_id)
+    except asyncio.CancelledError: pass
+    except Exception: log.exception('Question timer failed')
+
+async def answer_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    try: _, chat_s, idx_s, opt_s = cq.data.split(':'); chat_id, idx, opt = int(chat_s), int(idx_s), int(opt_s)
+    except Exception: await cq.answer('Invalid answer', show_alert=True); return
+    active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+    if not active or active['qindex'] != idx: await cq.answer('ଏହି ପ୍ରଶ୍ନର ସମୟ ସରିଗଲା।', show_alert=True); return
+    rt = runtime.get(chat_id)
+    if not rt: await cq.answer('Quiz restart ହୋଇଛି।', show_alert=True); return
+    uid = cq.from_user.id
+    if uid in rt['answered']: await cq.answer('ଏହି ପ୍ରଶ୍ନରେ ଉତ୍ତର ଦେଇସାରିଛ।', show_alert=True); return
+    quiz = quiz_for(active['quiz_id']); q = json.loads(quiz['questions_json'])[idx]
+    rt['answered'].add(uid); correct = q.get('answer'); points = 1 if correct is not None and opt == correct else 0
+    existing = db.execute('SELECT * FROM scores WHERE chat_id=? AND quiz_id=? AND user_id=?', (chat_id,quiz['id'],uid)).fetchone()
+    name = cq.from_user.full_name[:100]
+    if existing: db.execute('UPDATE scores SET score=score+?,answered=answered+1,username=? WHERE chat_id=? AND quiz_id=? AND user_id=?', (points,name,chat_id,quiz['id'],uid))
+    else: db.execute('INSERT INTO scores VALUES(?,?,?,?,?,1)', (chat_id,quiz['id'],uid,name,points))
+    db.commit(); await cq.answer('ଉତ୍ତର ଗ୍ରହଣ କରାଗଲା।')
+
+async def next_question(context, chat_id):
+    rt = runtime.get(chat_id, {}); task = rt.get('task')
+    if task and task is not asyncio.current_task() and not task.done(): task.cancel()
+    active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+    if not active: return
+    try: await context.bot.edit_message_reply_markup(chat_id, active['message_id'], reply_markup=None)
+    except TelegramError: pass
+    db.execute('UPDATE active_quizzes SET qindex=qindex+1 WHERE chat_id=?', (chat_id,)); db.commit()
+    await ask_question(context, chat_id)
+
+async def finish_quiz(context, chat_id):
+    active = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat_id,)).fetchone()
+    if not active: return
+    quiz = quiz_for(active['quiz_id']); rt = runtime.get(chat_id, {})
+    task = rt.get('task')
+    if task and task is not asyncio.current_task() and not task.done(): task.cancel()
+    db.execute("UPDATE active_quizzes SET state='finished' WHERE chat_id=?", (chat_id,)); db.commit()
+    rows = db.execute('SELECT username,score FROM scores WHERE chat_id=? AND quiz_id=? ORDER BY score DESC,username LIMIT 10', (chat_id,quiz['id'])).fetchall()
+    text = f"🏁 <b>{html.escape(quiz['title'])} — Quiz Completed!</b>\n\n🏆 <b>Final Leaderboard (Top 10)</b>"
+    medals = ['🥇','🥈','🥉']
+    if not rows: text += '\n\nକେହି ଉତ୍ତର ଦେଇନାହାନ୍ତି।'
+    for i,r in enumerate(rows): text += f"\n{medals[i] if i<3 else str(i+1)+'.'} {html.escape(r['username'])} — <b>{r['score']}</b>"
+    if quiz['funny']: text += '\n\n' + html.escape(quiz['funny'])
+    await context.bot.send_message(chat_id, text, parse_mode='HTML')
+    # Delete quiz intro and question messages; keep the final leaderboard.
+    for mid in rt.get('message_ids', []):
+        try: await context.bot.delete_message(chat_id, mid)
+        except TelegramError: pass
+    runtime.pop(chat_id, None)
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (update.effective_chat.id,)).fetchone()
+    if not row: await update.effective_message.reply_text('ଏହି Group ରେ Quiz ଚାଲୁ ନାହିଁ।')
+    else:
+        q = quiz_for(row['quiz_id']); await update.effective_message.reply_text(f"ଚାଲୁଥିବା Quiz: {q['title']} | Question {row['qindex']+1}")
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP,ChatType.SUPERGROUP): await update.effective_message.reply_text('Group ରେ /stopquiz ବ୍ୟବହାର କରନ୍ତୁ।'); return
+    admins = await context.bot.get_chat_administrators(chat.id)
+    if not any(a.user.id == update.effective_user.id for a in admins): await update.effective_message.reply_text('କେବଳ Group Admin Quiz ବନ୍ଦ କରିପାରିବେ।'); return
+    row = db.execute("SELECT * FROM active_quizzes WHERE chat_id=? AND state='running'", (chat.id,)).fetchone()
+    if not row: await update.effective_message.reply_text('Quiz ଚାଲୁ ନାହିଁ।'); return
+    rt = runtime.get(chat.id, {}); task = rt.get('task')
+    if task and not task.done(): task.cancel()
+    db.execute("UPDATE active_quizzes SET state='stopped' WHERE chat_id=?", (chat.id,)); db.commit()
+    for mid in rt.get('message_ids',[]):
+        try: await context.bot.delete_message(chat.id,mid)
+        except TelegramError: pass
+    runtime.pop(chat.id,None); await update.effective_message.reply_text('⛔ Quiz ବନ୍ଦ ହେଲା। Saved Quiz ରହିବ।')
+
+async def post_init(app):
+    db.execute("UPDATE active_quizzes SET state='interrupted' WHERE state='running'"); db.commit()
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("timer", timer_command))
-    app.add_handler(CommandHandler("shuffle", shuffle_command))
-    app.add_handler(CommandHandler("pause", pause_command))
-    app.add_handler(CommandHandler("resume", resume_command))
-    app.add_handler(CommandHandler("next", next_command))
-    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    app.add_handler(CommandHandler("share", share_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(CallbackQueryHandler(config_callback, pattern=r"^cfg\|"))
-    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans\|"))
-    app.post_init = post_init
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler('start',start_cmd))
+    app.add_handler(CommandHandler('help',help_cmd))
+    app.add_handler(CommandHandler('register',register_cmd))
+    app.add_handler(CommandHandler('myquizzes',myquizzes_cmd))
+    app.add_handler(CommandHandler('groups',groups_cmd))
+    app.add_handler(CommandHandler('cancel',cancel_cmd))
+    app.add_handler(CommandHandler('statusquiz',status_cmd))
+    app.add_handler(CommandHandler('stopquiz',stop_cmd))
+    app.add_handler(CallbackQueryHandler(answer_button, pattern=r'^ans:'))
+    app.add_handler(CallbackQueryHandler(buttons, pattern=r'^(quiz:|share:)'))
+    app.add_handler(MessageHandler(filters.Document.ALL,receive_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,draft_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__': main()

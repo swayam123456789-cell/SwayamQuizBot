@@ -1,27 +1,13 @@
-Q1. What is the capital of India?
-ଭାରତର ରାଜଧାନୀ କ'ଣ?
+Q1. ଭାରତର ରାଜଧାନୀ କ'ଣ?
+A) ମୁମ୍ବାଇ
+B) ନୂଆଦିଲ୍ଲୀ
+C) କୋଲକାତା
+D) ଚେନ୍ନାଇ
+Answer: B
 
-A. Mumbai
-ମୁମ୍ବାଇ
-B. New Delhi
-ନୂଆଦିଲ୍ଲୀ
-C. Kolkata
-କୋଲକାତା
-D. Chennai
-ଚେନ୍ନାଇ
-
-Correct Answer: B
-
-Q2. Which planet is known as the Red Planet?
-କେଉଁ ଗ୍ରହକୁ ଲାଲ ଗ୍ରହ କୁହାଯାଏ?
-
-A. Venus
-ଶୁକ୍ର
-B. Mars
-ମଙ୍ଗଳ
-C. Jupiter
-ବୃହସ୍ପତି
-D. Saturn
-ଶନି
-
-Correct Answer: B
+Q2. ଭାରତୀୟ ସମ୍ବିଧାନ କେବେ ଗ୍ରହଣ କରାଯାଇଥିଲା?
+A) 15 ଅଗଷ୍ଟ 1947
+B) 26 ଜାନୁଆରୀ 1950
+C) 26 ନଭେମ୍ବର 1949
+D) 2 ଅକ୍ଟୋବର 1950
+Answer: C

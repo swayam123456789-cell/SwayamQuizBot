@@ -1,68 +1,42 @@
-SWAYAMQUIZBOT ADVANCED PACKAGE
+SWAYAM QUIZ BOT — LIVE GROUP QUIZ
 
-Included files:
-- bot.py
-- requirements.txt
-- render.yaml
-- sample_quiz.txt
+WHAT IT DOES
+- Create a quiz in the bot's PRIVATE chat by sending a .txt MCQ file.
+- Save quiz title, topic, intro, funny completion message and timer.
+- Choose a registered Telegram group and start the quiz there.
+- Participants answer with buttons; one answer per user per question.
+- Final Top 10 leaderboard appears when the quiz ends.
+- Bot tries to delete its intro/question messages after the quiz, but keeps the final leaderboard.
+- Saved quiz data is stored in SQLite.
 
-FEATURES
-- Upload a .txt file in a private chat or a channel where the bot is an administrator.
-- English question first, optional Odia question on the next line.
-- Each option can have English first and optional Odia on the next line.
-- Default timer: 15 seconds.
-- Timer choices: 10, 15, 30, 45 seconds and 1–5 minutes.
-- Timer automatically advances the quiz in group/channel mode.
-- Private practice advances after the user answers.
-- Shuffle questions and/or options.
-- Top 10 results, pause, resume, next, stop, and share link.
-- /settings opens timer and shuffle buttons.
+SETUP
+1. Replace bot.py and requirements.txt in your existing GitHub repository with the files in this package. You may upload the other files too.
+2. In Render, make sure the service is a Background Worker with start command: python bot.py
+3. Render > Environment: set BOT_TOKEN to the CURRENT token from BotFather. Do not share this token.
+4. Deploy/redeploy and check logs.
+5. In Telegram, open the bot privately and send /start.
 
-SETUP (Render + GitHub)
-1. Download and extract this ZIP.
-2. Upload the files to your existing GitHub repository, replacing the old bot.py and requirements.txt.
-3. In Render, confirm Start Command is: python bot.py
-4. In Render > Environment, add BOT_TOKEN = your BotFather token.
-5. Deploy the latest commit.
-6. Add the bot as an administrator to each channel where it should post quiz questions and results. Give it permission to post messages.
-7. Test in private chat first by uploading sample_quiz.txt.
+HOW TO USE
+1. Add the bot to your Telegram group and promote it to Admin. Enable permission to delete messages.
+2. In the group, a group admin sends /register.
+3. In the bot's private chat, upload a .txt MCQ file.
+4. Follow prompts for title, topic, intro, completion/funny message, and timer (5-120 seconds). Send - to skip optional text.
+5. Send /myquizzes, choose a quiz, then choose the group.
+6. In a group, use /stopquiz to stop a running quiz (group admins only).
 
-SUPPORTED TXT FORMAT
+TXT FORMAT
 Q1. What is the capital of India?
-ଭାରତର ରାଜଧାନୀ କ'ଣ?
+A) Mumbai
+B) New Delhi
+C) Kolkata
+D) Chennai
+Answer: B
 
-A. Mumbai
-ମୁମ୍ବାଇ
-B. New Delhi
-ନୂଆଦିଲ୍ଲୀ
-C. Kolkata
-କୋଲକାତା
-D. Chennai
-ଚେନ୍ନାଇ
+SCORING
+Each question needs an answer key like Answer: B. Without keys, quiz questions still show but scores cannot be calculated.
 
-Correct Answer: B
-
-Then continue with Q2. etc. Correct Answer is required for every question.
-
-COMMANDS
-/start
-/settings
-/timer 15
-/shuffle all
-/shuffle questions
-/shuffle options
-/shuffle off
-/pause
-/resume
-/next
-/leaderboard
-/share
-/stop
-
-IMPORTANT LIMITATIONS
-- This package is a complete starter implementation, but it has not been installed or tested against your existing Render deployment. Test it in private chat before relying on it in a public channel.
-- Active quizzes, settings, and share-link definitions are stored in memory and are lost if the Render process restarts or redeploys.
-- Share links work while the process remains running and the quiz definition remains in memory.
-- Telegram channels do not provide normal per-user message replies; users answer using inline buttons. Bot must be admin with posting permission.
-- For production-quality persistence across restarts, a database would be needed.
-- Never publish your BotFather token in GitHub. Use Render Environment Variables.
+IMPORTANT
+- This is a first complete implementation; test in a small test group before using it in a large group.
+- Render free-service availability and sleep/restart behavior may change. If the database file is on ephemeral storage, quizzes can be lost after redeploy/restart. Use a persistent disk/database for reliable long-term storage where supported.
+- Telegram only permits deletion when the bot has the required admin permissions and within Telegram's message-deletion rules.
+- Bot restarts interrupt live quizzes; saved quizzes persist only if the SQLite file persists.
