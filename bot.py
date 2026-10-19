@@ -546,7 +546,7 @@ async def quiz_detail(update, context):
         await q.message.reply_text("Quiz ମିଳିଲା ନାହିଁ।")
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Private ରେ ଖେଳ", callback_data=f"ownerplay_{quiz_id}")],
+        [InlineKeyboardButton("▶️ Private ରେ ଦିଅ", callback_data=f"ownerplay_{quiz_id}")],
         [InlineKeyboardButton("👥 Group ରେ ଚଲାଅ", callback_data=f"pickgroup_{quiz_id}")],
         [InlineKeyboardButton("🔗 Share Link", callback_data=f"share_{quiz_id}")],
         [InlineKeyboardButton("📊 Stats", callback_data=f"stats_{quiz_id}")],
@@ -1139,6 +1139,12 @@ def main():
     app.add_error_handler(on_error)
 
     log.info("SwayamQuizBot starting polling")
+    # Python 3.14 no longer creates a default event loop automatically.
+    # python-telegram-bot's run_polling() expects a current loop, so create one explicitly.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=False)
 
 
