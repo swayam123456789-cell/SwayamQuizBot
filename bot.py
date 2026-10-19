@@ -135,7 +135,7 @@ def owner_menu():
 
 
 def denied_text():
-    return "ଏହି bot ର Owner Menu କେବଳ ମାଲିକଙ୍କ ପାଇଁ। Quiz ଖେଳିବାକୁ ମାଲିକଙ୍କ share link ଖୋଲନ୍ତୁ।"
+    return "ଏହି bot ର Owner Menu କେବଳ ମାଲିକଙ୍କ ପାଇଁ। Quiz ପାଇଁ ownerଙ୍କ share link ଖୋଲନ୍ତୁ।"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,7 +168,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_owner(update.effective_user.id, context):
         await update.effective_message.reply_text(denied_text())
         return
     supplied = " ".join(context.args).strip()
