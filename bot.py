@@ -1,6 +1,5 @@
 import os
 import re
-import secrets
 import sqlite3
 import asyncio
 import threading
@@ -19,7 +18,6 @@ log = logging.getLogger("SwayamQuizBot")
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
-OWNER_PASSWORD = os.getenv("OWNER_PASSWORD", "").strip()
 DB_PATH = os.getenv("DB_PATH", "swayam_quiz.db")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -27,8 +25,6 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN missing. Add BOT_TOKEN in Render Environment.")
 if not OWNER_ID_RAW.isdigit():
     raise RuntimeError("OWNER_ID missing/invalid. Add your numeric Telegram user ID in Render Environment.")
-if len(OWNER_PASSWORD) < 6:
-    raise RuntimeError("OWNER_PASSWORD missing/too short. Set a password of at least 6 characters in Render Environment.")
 OWNER_ID = int(OWNER_ID_RAW)
 
 web = Flask(__name__)
@@ -97,7 +93,6 @@ def init_db():
             finished_at TEXT
         );
         """)
-        # Migrate older database column names safely.
         cols = {r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()}
         if "motivation" not in cols:
             db.execute("ALTER TABLE quizzes ADD COLUMN motivation TEXT DEFAULT ''")
@@ -108,17 +103,15 @@ def init_db():
             db.execute("ALTER TABLE responses ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0")
 
 
-# Manual quiz conversation states
 TITLE, TOPIC, INTRO, TIMER, MOTIVATION, QUESTION, A, B, C, D, ANSWER = range(11)
-EDIT_TEXT = 50
 
 
 def is_owner(user_id):
     return user_id == OWNER_ID
 
 
-def is_authorized(user_id, context):
-    return user_id == OWNER_ID and bool(context.user_data.get("owner_unlocked"))
+def is_authorized(user_id, context=None):
+    return is_owner(user_id)
 
 
 def owner_menu():
@@ -135,7 +128,7 @@ def owner_menu():
 
 
 def denied_text():
-    return "ଏହି bot ର Owner Menu କେବଳ ମାଲିକଙ୍କ ପାଇଁ। Quiz ପାଇଁ ownerଙ୍କ share link ଖୋଲନ୍ତୁ।"
+    return "ଏହି bot ର Owner Menu କେବଳ ମାଲିକଙ୍କ ପାଇଁ। Quiz ଖେଳିବାକୁ ମାଲିକଙ୍କ share link ଖୋଲନ୍ତୁ।"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,14 +137,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await msg.reply_text("👋 ନମସ୍କାର! Quiz ଖେଳିବାକୁ option ରେ click କରନ୍ତୁ। Bot ର menu ମାଲିକଙ୍କ Private Chat ରେ ରହିବ।")
         return
+    payload = context.args[0] if context.args else ""
+    if payload.startswith("quiz_") and payload[5:].isdigit():
+        await start_private_quiz(update, context, int(payload[5:]))
+        return
     if is_owner(user.id):
-        payload = context.args[0] if context.args else ""
-        if payload.startswith("quiz_") and payload[5:].isdigit():
-            await start_private_quiz(update, context, int(payload[5:]))
-            return
-        if not context.user_data.get("owner_unlocked"):
-            await msg.reply_text("🔐 Owner Menu locked ଅଛି। Password ଖୋଲିବା ପାଇଁ /unlock ଲେଖି password ପଠାନ୍ତୁ।")
-            return
         await msg.reply_text(
             "👋 ନମସ୍କାର! SwayamQuizBot କୁ ସ୍ୱାଗତ।\n\n"
             "ଏହା ତୁମର Owner Menu। ଏଠାରୁ Quiz ତିଆରି, Edit, Share ଓ Stats ଦେଖିପାରିବ।\n\n"
@@ -159,31 +149,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=owner_menu()
         )
     else:
-        payload = context.args[0] if context.args else ""
-        if payload.startswith("quiz_") and payload[5:].isdigit():
-            await start_private_quiz(update, context, int(payload[5:]))
-        else:
-            await msg.reply_text("👋 ନମସ୍କାର! Quiz ଖେଳିବାକୁ ମାଲିକଙ୍କଠାରୁ ମିଳିଥିବା Quiz Link ଖୋଲନ୍ତୁ।")
-
-
-
-async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id, context):
-        await update.effective_message.reply_text(denied_text())
-        return
-    supplied = " ".join(context.args).strip()
-    if not supplied:
-        await update.effective_message.reply_text("🔐 /unlock ତାପରେ space ଦେଇ owner password ଲେଖନ୍ତୁ।")
-        return
-    if not secrets.compare_digest(supplied, OWNER_PASSWORD):
-        await update.effective_message.reply_text("❌ Password ଭୁଲ। ପୁଣି ଚେଷ୍ଟା କରନ୍ତୁ।")
-        return
-    context.user_data["owner_unlocked"] = True
-    await update.effective_message.reply_text("✅ Owner login ସଫଳ।", reply_markup=owner_menu())
+        await msg.reply_text("👋 ନମସ୍କାର! Quiz ଖେଳିବାକୁ ମାଲିକଙ୍କଠାରୁ ମିଳିଥିବା Quiz Link ଖୋଲନ୍ତୁ।")
 
 
 async def help_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    help_message = (
         "📘 ବ୍ୟବହାର:\n"
         "• Quiz ତିଆରି: Private Chat → Quiz ତିଆରି\n"
         "• Copy-Paste: MCQ text ସିଧା ପଠାନ୍ତୁ\n"
@@ -196,9 +166,9 @@ async def help_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         q = update.callback_query
         await q.answer()
-        await q.message.reply_text(text, reply_markup=owner_menu() if is_authorized(q.from_user.id, context) else None)
+        await q.message.reply_text(help_message, reply_markup=owner_menu() if is_owner(q.from_user.id) else None)
     else:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(help_message)
 
 
 async def txt_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,16 +176,13 @@ async def txt_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await q.message.reply_text(
         "📄 MCQ Copy-Paste / TXT Format:\n\n"
-        "Q1. ପ୍ରଶ୍ନ ଲେଖନ୍ତୁ\n"
-        "A. Option A\nB. Option B\nC. Option C\nD. Option D\n"
-        "Correct Answer: B\n\n"
-        "ପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନ ପାଇଁ ଏହି format ଦୋହରାନ୍ତୁ। "
-        "Text ସିଧା ପଠାଇପାରିବେ କିମ୍ବା ଏହି text କୁ .txt file କରି upload କରିପାରିବେ।"
+        "Q1. ପ୍ରଶ୍ନ ଲେଖନ୍ତୁ\nA. Option A\nB. Option B\nC. Option C\nD. Option D\n"
+        "Correct Answer: B\n\nପ୍ରତ୍ୟେକ ପ୍ରଶ୍ନ ପାଇଁ ଏହି format ଦୋହରାନ୍ତୁ। Text ସିଧା ପଠାଇପାରିବେ କିମ୍ବା .txt file upload କରିପାରିବେ।"
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         await update.effective_message.reply_text(denied_text())
         return ConversationHandler.END
     context.user_data.pop("draft", None)
@@ -224,7 +191,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         await update.effective_message.reply_text(denied_text())
         return ConversationHandler.END
     draft = context.user_data.get("draft")
@@ -235,18 +202,14 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("ପ୍ରଥମେ ଅତି କମରେ 1ଟି ପ୍ରଶ୍ନ ଯୋଡ଼ନ୍ତୁ।")
         return QUESTION
     quiz_id = save_quiz(OWNER_ID, draft)
-    count = len(draft["questions"])
-    title = draft["title"]
+    count, title = len(draft["questions"]), draft["title"]
     context.user_data.pop("draft", None)
-    await update.effective_message.reply_text(
-        f"🎉 Quiz ସମ୍ପୂର୍ଣ୍ଣ ହେଲା!\nନାମ: {title}\nପ୍ରଶ୍ନ: {count}\nQuiz ID: {quiz_id}",
-        reply_markup=owner_menu()
-    )
+    await update.effective_message.reply_text(f"🎉 Quiz ସମ୍ପୂର୍ଣ୍ଣ ହେଲା!\nନାମ: {title}\nପ୍ରଶ୍ନ: {count}\nQuiz ID: {quiz_id}", reply_markup=owner_menu())
     return ConversationHandler.END
 
 
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         await update.effective_message.reply_text(denied_text())
         return
     draft = context.user_data.get("draft")
@@ -268,7 +231,7 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return ConversationHandler.END
     context.user_data["draft"] = {"questions": [], "timer": 15, "motivation": ""}
@@ -356,17 +319,15 @@ def save_quiz(owner_id, draft):
         )
         quiz_id = cur.lastrowid
         for number, item in enumerate(draft["questions"], 1):
-            db.execute(
-                "INSERT INTO questions(quiz_id,q_no,question,a,b,c,d,answer) VALUES(?,?,?,?,?,?,?,?)",
-                (quiz_id, number, item["question"], item["a"], item["b"], item["c"], item["d"], item["answer"])
-            )
+            db.execute("INSERT INTO questions(quiz_id,q_no,question,a,b,c,d,answer) VALUES(?,?,?,?,?,?,?,?)",
+                       (quiz_id, number, item["question"], item["a"], item["b"], item["c"], item["d"], item["answer"]))
     return quiz_id
 
 
 async def get_answer(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return ConversationHandler.END
     draft = context.user_data.get("draft")
@@ -380,21 +341,17 @@ async def get_answer(update, context):
         [InlineKeyboardButton("✅ /done — Quiz ସମ୍ପୂର୍ଣ୍ଣ", callback_data="save")],
         [InlineKeyboardButton("❌ ବାତିଲ୍", callback_data="cancel_draft")]
     ])
-    await q.message.reply_text(
-        f"✅ ପ୍ରଶ୍ନ {len(draft['questions'])} ଯୋଡ଼ାଗଲା।\nଆଉ ପ୍ରଶ୍ନ ଯୋଡ଼ନ୍ତୁ କି Quiz ସମ୍ପୂର୍ଣ୍ଣ କରନ୍ତୁ?",
-        reply_markup=kb
-    )
+    await q.message.reply_text(f"✅ ପ୍ରଶ୍ନ {len(draft['questions'])} ଯୋଡ଼ାଗଲା।\nଆଉ ପ୍ରଶ୍ନ ଯୋଡ଼ନ୍ତୁ କି Quiz ସମ୍ପୂର୍ଣ୍ଣ କରନ୍ତୁ?", reply_markup=kb)
     return QUESTION
 
 
 async def draft_next(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return ConversationHandler.END
-    data = q.data
-    draft = context.user_data.get("draft")
+    data, draft = q.data, context.user_data.get("draft")
     if data == "cancel_draft":
         context.user_data.pop("draft", None)
         await q.message.reply_text("❌ Draft ବାତିଲ୍ ହେଲା।", reply_markup=owner_menu())
@@ -417,23 +374,18 @@ async def draft_next(update, context):
     return QUESTION
 
 
-# Parser for Q1./Question 1/1. plus A-D and Correct Answer: B.
 def parse_mcqs(raw):
     lines = [line.strip() for line in raw.replace("\r", "\n").splitlines()]
     found, current = [], None
     qpat = re.compile(r"^(?:Q(?:UESTION)?\s*\d*\s*[.):\-]\s*|\d+[.)]\s+)(.+)$", re.I)
     opat = re.compile(r"^([A-D])[.):\-]\s*(.+)$", re.I)
     apat = re.compile(r"^(?:(?:correct|right)\s*)?answer\s*[:\-]\s*([A-D])\b", re.I)
-
     def finish():
         nonlocal current
         if current and all(k in current for k in ("A", "B", "C", "D", "answer")):
-            found.append({
-                "question": current["question"].strip(), "a": current["A"], "b": current["B"],
-                "c": current["C"], "d": current["D"], "answer": current["answer"]
-            })
+            found.append({"question": current["question"].strip(), "a": current["A"], "b": current["B"],
+                          "c": current["C"], "d": current["D"], "answer": current["answer"]})
         current = None
-
     for line in lines:
         if not line:
             continue
@@ -461,24 +413,16 @@ def parse_mcqs(raw):
 async def import_questions(update, context, raw, title):
     questions = parse_mcqs(raw)
     if not questions:
-        await update.effective_message.reply_text(
-            "❌ ପ୍ରଶ୍ନ ଚିହ୍ନଟ ହେଲା ନାହିଁ। Format:\nQ1. Question\nA. Option\nB. Option\nC. Option\nD. Option\nCorrect Answer: B"
-        )
+        await update.effective_message.reply_text("❌ ପ୍ରଶ୍ନ ଚିହ୍ନଟ ହେଲା ନାହିଁ। Format:\nQ1. Question\nA. Option\nB. Option\nC. Option\nD. Option\nCorrect Answer: B")
         return
-    quiz_id = save_quiz(OWNER_ID, {
-        "title": title[:120] or "Imported Quiz", "topic": "Imported MCQ",
-        "intro": "", "timer": 15, "motivation": "", "questions": questions
-    })
-    await update.effective_message.reply_text(
-        f"✅ Quiz ତିଆରି ହେଲା!\nନାମ: {title}\nପ୍ରଶ୍ନ: {len(questions)}\nQuiz ID: {quiz_id}",
-        reply_markup=owner_menu()
-    )
+    quiz_id = save_quiz(OWNER_ID, {"title": title[:120] or "Imported Quiz", "topic": "Imported MCQ",
+                                   "intro": "", "timer": 15, "motivation": "", "questions": questions})
+    await update.effective_message.reply_text(f"✅ Quiz ତିଆରି ହେଲା!\nନାମ: {title}\nପ୍ରଶ୍ନ: {len(questions)}\nQuiz ID: {quiz_id}", reply_markup=owner_menu())
 
 
-async def handle_text_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not is_authorized(user.id, context) or not msg or not msg.text:
+async def handle_text_import(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if not user or not is_authorized(user.id) or not msg or not msg.text:
         return
     if context.user_data.get("draft"):
         return
@@ -492,9 +436,9 @@ async def handle_text_import(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await import_questions(update, context, text, title)
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_document(update, context):
     msg = update.effective_message
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         await msg.reply_text(denied_text())
         return
     doc = msg.document
@@ -535,7 +479,7 @@ async def show_quizzes(update, context):
 async def quiz_detail(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -546,7 +490,7 @@ async def quiz_detail(update, context):
         await q.message.reply_text("Quiz ମିଳିଲା ନାହିଁ।")
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Private ରେ ଦିଅ", callback_data=f"ownerplay_{quiz_id}")],
+        [InlineKeyboardButton("▶️ Private ରେ ଖେଳ", callback_data=f"ownerplay_{quiz_id}")],
         [InlineKeyboardButton("👥 Group ରେ ଚଲାଅ", callback_data=f"pickgroup_{quiz_id}")],
         [InlineKeyboardButton("🔗 Share Link", callback_data=f"share_{quiz_id}")],
         [InlineKeyboardButton("📊 Stats", callback_data=f"stats_{quiz_id}")],
@@ -555,10 +499,7 @@ async def quiz_detail(update, context):
         [InlineKeyboardButton("🗑 Delete Quiz", callback_data=f"deleteask_{quiz_id}")],
         [InlineKeyboardButton("⬅️ ସମସ୍ତ Quiz", callback_data="myquizzes")]
     ])
-    await q.message.reply_text(
-        f"📚 {quiz['title']}\nTopic: {quiz['topic'] or '-'}\nପ୍ରଶ୍ନ: {count}\nTimer: {quiz['timer']} seconds",
-        reply_markup=kb
-    )
+    await q.message.reply_text(f"📚 {quiz['title']}\nTopic: {quiz['topic'] or '-'}\nପ୍ରଶ୍ନ: {count}\nTimer: {quiz['timer']} seconds", reply_markup=kb)
 
 
 async def show_groups(update, context):
@@ -574,14 +515,13 @@ async def show_groups(update, context):
     with connect() as db:
         rows = db.execute("SELECT title,chat_id FROM groups_seen WHERE added_by=? ORDER BY title", (OWNER_ID,)).fetchall()
     if not rows:
-        await target.reply_text("Group ନାହିଁ। Bot କୁ group admin କରି group ଭିତରେ /register ପଠାନ୍ତୁ।")
+        await target.reply_text("Group ନାହିଁ। Bot କୁ Group Admin କରି group ଭିତରେ /register ପଠାନ୍ତୁ।")
         return
     await target.reply_text("👥 Registered Groups:\n" + "\n".join(f"• {r['title']}" for r in rows))
 
 
 async def register_group(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
+    chat, user = update.effective_chat, update.effective_user
     if chat.type == "private":
         await update.effective_message.reply_text("Group ଭିତରେ /register ପଠାନ୍ତୁ।")
         return
@@ -597,18 +537,15 @@ async def register_group(update, context):
         await update.effective_message.reply_text("Bot କୁ Group Admin କରି ପୁଣି /register ପଠାନ୍ତୁ।")
         return
     with connect() as db:
-        db.execute(
-            "INSERT INTO groups_seen(chat_id,title,added_by) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, added_by=excluded.added_by",
-            (chat.id, chat.title or "Telegram Group", OWNER_ID)
-        )
+        db.execute("INSERT INTO groups_seen(chat_id,title,added_by) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, added_by=excluded.added_by",
+                   (chat.id, chat.title or "Telegram Group", OWNER_ID))
     await update.effective_message.reply_text("✅ Group register ହେଲା। ଏବେ Private Chat ର My Quizzes ରୁ Quiz ଚଲାନ୍ତୁ।")
 
 
 async def pick_group(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -625,7 +562,7 @@ async def pick_group(update, context):
 async def share_quiz(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -636,15 +573,12 @@ async def share_quiz(update, context):
         return
     me = await context.bot.get_me()
     link = f"https://t.me/{me.username}?start=quiz_{quiz_id}"
-    await q.message.reply_text(
-        f"🔗 Quiz Share Link\n{quiz['title']}\n\n{link}\n\nଏହି link share କଲେ ବ୍ୟକ୍ତି Private Chat ରେ Quiz ଖେଳିପାରିବେ।",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Share Link", url=link)]])
-    )
+    await q.message.reply_text(f"🔗 Quiz Share Link\n{quiz['title']}\n\n{link}\n\nଏହି link share କଲେ ବ୍ୟକ୍ତି Private Chat ରେ Quiz ଖେଳିପାରିବେ।",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Share Link", url=link)]]))
 
 
 async def start_private_quiz(update, context, quiz_id):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+    user, chat_id = update.effective_user, update.effective_chat.id
     with connect() as db:
         quiz = db.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
         count = db.execute("SELECT COUNT(*) n FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()["n"]
@@ -657,30 +591,29 @@ async def start_private_quiz(update, context, quiz_id):
 async def owner_play(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
-    await start_run(context, quiz_id, q.from_user.id, OWNER_ID, is_private=True)
+    await start_run(context, quiz_id, q.message.chat_id, OWNER_ID, is_private=True)
 
 
 async def start_run(context, quiz_id, chat_id, started_by, is_private=False):
     with connect() as db:
         quiz = db.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
         count = db.execute("SELECT COUNT(*) n FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()["n"]
+        if not quiz or not count:
+            await context.bot.send_message(chat_id, "Quiz ମିଳିଲା ନାହିଁ।")
+            return
         run_id = db.execute("INSERT INTO quiz_runs(quiz_id,chat_id,started_by) VALUES(?,?,?)", (quiz_id, chat_id, started_by)).lastrowid
-    if not quiz or not count:
-        await context.bot.send_message(chat_id, "Quiz ମିଳିଲା ନାହିଁ।")
-        return
     active = context.application.bot_data.setdefault("active_runs", {})
     key = (quiz_id, chat_id)
-    if key in active:
-        active.pop(key, None)
-    active[key] = {
-        "index": 0, "count": count, "quiz_id": quiz_id, "chat_id": chat_id,
-        "started_by": started_by, "is_private": is_private, "message_id": None,
-        "deadline_task": None, "run_id": run_id
-    }
+    old = active.pop(key, None)
+    if old and old.get("deadline_task"):
+        old["deadline_task"].cancel()
+    active[key] = {"index": 0, "count": count, "quiz_id": quiz_id, "chat_id": chat_id,
+                   "started_by": started_by, "is_private": is_private, "message_id": None,
+                   "deadline_task": None, "run_id": run_id}
     if quiz["intro"]:
         await context.bot.send_message(chat_id, f"📣 {quiz['title']}\n\n{quiz['intro']}")
     await context.bot.send_message(chat_id, f"🎯 Quiz ଆରମ୍ଭ!\n{quiz['title']}\nମୋଟ ପ୍ରଶ୍ନ: {count}\nTimer: {quiz['timer']} seconds")
@@ -689,8 +622,7 @@ async def start_run(context, quiz_id, chat_id, started_by, is_private=False):
 
 async def send_question(context, quiz_id, chat_id, index):
     key = (quiz_id, chat_id)
-    active_runs = context.application.bot_data.setdefault("active_runs", {})
-    run = active_runs.get(key)
+    run = context.application.bot_data.setdefault("active_runs", {}).get(key)
     with connect() as db:
         quiz = db.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
         row = db.execute("SELECT * FROM questions WHERE quiz_id=? AND q_no=?", (quiz_id, index + 1)).fetchone()
@@ -704,19 +636,14 @@ async def send_question(context, quiz_id, chat_id, index):
         [InlineKeyboardButton(f"C. {row['c']}", callback_data=f"vote_{quiz_id}_{index}_C")],
         [InlineKeyboardButton(f"D. {row['d']}", callback_data=f"vote_{quiz_id}_{index}_D")]
     ])
-    message = await context.bot.send_message(
-        chat_id,
-        f"❓ ପ୍ରଶ୍ନ {index+1}/{run['count']}\n⏱️ ସମୟ: {quiz['timer']} seconds\n\n{row['question']}",
-        reply_markup=keyboard
-    )
+    message = await context.bot.send_message(chat_id, f"❓ ପ୍ରଶ୍ନ {index+1}/{run['count']}\n⏱️ ସମୟ: {quiz['timer']} seconds\n\n{row['question']}", reply_markup=keyboard)
     run["message_id"] = message.message_id
     run["deadline_task"] = asyncio.create_task(question_timeout(context, quiz_id, chat_id, index, quiz["timer"]))
 
 
 async def question_timeout(context, quiz_id, chat_id, index, seconds):
     await asyncio.sleep(seconds)
-    key = (quiz_id, chat_id)
-    run = context.application.bot_data.setdefault("active_runs", {}).get(key)
+    run = context.application.bot_data.setdefault("active_runs", {}).get((quiz_id, chat_id))
     if not run or run["index"] != index:
         return
     try:
@@ -725,22 +652,15 @@ async def question_timeout(context, quiz_id, chat_id, index, seconds):
         pass
     with connect() as db:
         qrow = db.execute("SELECT answer FROM questions WHERE quiz_id=? AND q_no=?", (quiz_id, index + 1)).fetchone()
-        rows = db.execute(
-            "SELECT choice,COUNT(*) n FROM responses WHERE quiz_id=? AND chat_id=? AND q_no=? AND run_id=? GROUP BY choice",
-            (quiz_id, chat_id, index + 1, run["run_id"])
-        ).fetchall()
+        rows = db.execute("SELECT choice,COUNT(*) n FROM responses WHERE quiz_id=? AND chat_id=? AND q_no=? AND run_id=? GROUP BY choice",
+                          (quiz_id, chat_id, index + 1, run["run_id"])).fetchall()
         total = sum(r["n"] for r in rows)
         correct = qrow["answer"] if qrow else "?"
     pct_lines = []
     for letter in "ABCD":
         n = next((r["n"] for r in rows if r["choice"] == letter), 0)
-        pct = round((n * 100 / total)) if total else 0
-        pct_lines.append(f"{'✅' if letter == correct else '▫️'} {letter}: {pct}% ({n})")
-    await context.bot.send_message(
-        chat_id,
-        f"📊 ଉତ୍ତର ଫଳାଫଳ (ମୋଟ ଉତ୍ତର: {total})\n" + "\n".join(pct_lines) +
-        f"\n\n✅ ସଠିକ୍ ଉତ୍ତର: {correct}"
-    )
+        pct_lines.append(f"{'✅' if letter == correct else '▫️'} {letter}: {round(n * 100 / total) if total else 0}% ({n})")
+    await context.bot.send_message(chat_id, f"📊 ଉତ୍ତର ଫଳାଫଳ (ମୋଟ ଉତ୍ତର: {total})\n" + "\n".join(pct_lines) + f"\n\n✅ ସଠିକ୍ ଉତ୍ତର: {correct}")
     run["index"] = index + 1
     await send_question(context, quiz_id, chat_id, index + 1)
 
@@ -759,24 +679,17 @@ async def vote(update, context):
     if not run or run["index"] != index:
         await q.answer("ଏହି ପ୍ରଶ୍ନର ସମୟ ସରିଯାଇଛି।", show_alert=True)
         return
-    if update.effective_chat.id != chat_id:
-        await q.answer("ଏହି Quiz ଅନ୍ୟ chat ପାଇଁ।", show_alert=True)
-        return
     with connect() as db:
-        exists = db.execute(
-            "SELECT id FROM responses WHERE quiz_id=? AND chat_id=? AND user_id=? AND q_no=? AND run_id=?",
-            (quiz_id, chat_id, user.id, index + 1, run["run_id"])
-        ).fetchone()
+        exists = db.execute("SELECT id FROM responses WHERE quiz_id=? AND chat_id=? AND user_id=? AND q_no=? AND run_id=?",
+                            (quiz_id, chat_id, user.id, index + 1, run["run_id"])).fetchone()
         if exists:
             await q.answer("ତୁମେ ଏହି ପ୍ରଶ୍ନର ଉତ୍ତର ଦେଇସାରିଛ।", show_alert=True)
             return
         qrow = db.execute("SELECT answer FROM questions WHERE quiz_id=? AND q_no=?", (quiz_id, index + 1)).fetchone()
         correct = bool(qrow and choice == qrow["answer"])
         name = user.full_name or user.username or str(user.id)
-        db.execute(
-            "INSERT INTO responses(quiz_id,chat_id,user_id,username,q_no,choice,is_correct,run_id) VALUES(?,?,?,?,?,?,?,?)",
-            (quiz_id, chat_id, user.id, name, index + 1, choice, int(correct), run["run_id"])
-        )
+        db.execute("INSERT INTO responses(quiz_id,chat_id,user_id,username,q_no,choice,is_correct,run_id) VALUES(?,?,?,?,?,?,?,?)",
+                   (quiz_id, chat_id, user.id, name, index + 1, choice, int(correct), run["run_id"]))
     await q.answer("✅ ସଠିକ୍ ଉତ୍ତର!" if correct else "❌ ଭୁଲ ଉତ୍ତର!", show_alert=True)
 
 
@@ -785,12 +698,10 @@ async def finish_quiz(context, quiz_id, chat_id):
     run = context.application.bot_data.setdefault("active_runs", {}).pop(key, None)
     with connect() as db:
         quiz = db.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        rows = db.execute(
-            "SELECT username,SUM(is_correct) points,COUNT(*) answered FROM responses "
-            "WHERE quiz_id=? AND chat_id=? AND run_id=? GROUP BY user_id,username ORDER BY points DESC,answered DESC,username LIMIT 10",
-            (quiz_id, chat_id, run["run_id"] if run else 0)
-        ).fetchall()
-        db.execute("UPDATE quiz_runs SET finished_at=CURRENT_TIMESTAMP WHERE quiz_id=? AND chat_id=? AND finished_at IS NULL", (quiz_id, chat_id))
+        rows = db.execute("SELECT username,SUM(is_correct) points,COUNT(*) answered FROM responses WHERE quiz_id=? AND chat_id=? AND run_id=? GROUP BY user_id,username ORDER BY points DESC,answered DESC,username LIMIT 10",
+                          (quiz_id, chat_id, run["run_id"] if run else 0)).fetchall()
+        if run:
+            db.execute("UPDATE quiz_runs SET finished_at=CURRENT_TIMESTAMP WHERE id=?", (run["run_id"],))
         total_questions = db.execute("SELECT COUNT(*) n FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()["n"]
         participants = db.execute("SELECT COUNT(DISTINCT user_id) n FROM responses WHERE quiz_id=? AND chat_id=?", (quiz_id, chat_id)).fetchone()["n"]
     text = "🏆 Quiz ସମାପ୍ତ!\n\n📊 Top 10 Leaderboard\n\n"
@@ -804,7 +715,7 @@ async def finish_quiz(context, quiz_id, chat_id):
 async def stats_list(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     with connect() as db:
@@ -812,15 +723,13 @@ async def stats_list(update, context):
     if not rows:
         await q.message.reply_text("Stats ଦେଖିବାକୁ Quiz ନାହିଁ।")
         return
-    await q.message.reply_text("କେଉଁ Quiz ର Stats ଦେଖିବେ?", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton(r["title"], callback_data=f"stats_{r['id']}")] for r in rows
-    ]))
+    await q.message.reply_text("କେଉଁ Quiz ର Stats ଦେଖିବେ?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(r["title"], callback_data=f"stats_{r['id']}")] for r in rows]))
 
 
 async def show_stats(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -834,19 +743,11 @@ async def show_stats(update, context):
         total_answers = db.execute("SELECT COUNT(*) n FROM responses WHERE quiz_id=?", (quiz_id,)).fetchone()["n"]
         correct_count = db.execute("SELECT COUNT(*) n FROM responses WHERE quiz_id=? AND is_correct=1", (quiz_id,)).fetchone()["n"]
         chats = db.execute("SELECT COUNT(DISTINCT chat_id) n FROM quiz_runs WHERE quiz_id=?", (quiz_id,)).fetchone()["n"]
-        per_q = db.execute(
-            "SELECT q_no,COUNT(*) n,SUM(is_correct) correct FROM responses WHERE quiz_id=? GROUP BY q_no ORDER BY q_no",
-            (quiz_id,)
-        ).fetchall()
-    text = (
-        f"📊 Quiz Stats: {quiz['title']}\n\n"
-        f"❓ ମୋଟ ପ୍ରଶ୍ନ: {question_count}\n"
-        f"👥 Unique Participants: {total_people}\n"
-        f"🗳️ ମୋଟ ଉତ୍ତର: {total_answers}\n"
-        f"✅ ସଠିକ୍ ଉତ୍ତର: {correct_count}\n"
-        f"💯 Accuracy: {round(correct_count * 100 / total_answers) if total_answers else 0}%\n"
-        f"▶️ Chat/Group Runs: {chats}\n\nପ୍ରଶ୍ନ ଅନୁସାରେ ଉତ୍ତର:"
-    )
+        per_q = db.execute("SELECT q_no,COUNT(*) n,SUM(is_correct) correct FROM responses WHERE quiz_id=? GROUP BY q_no ORDER BY q_no", (quiz_id,)).fetchall()
+    text = (f"📊 Quiz Stats: {quiz['title']}\n\n❓ ମୋଟ ପ୍ରଶ୍ନ: {question_count}\n"
+            f"👥 Unique Participants: {total_people}\n🗳️ ମୋଟ ଉତ୍ତର: {total_answers}\n"
+            f"✅ ସଠିକ୍ ଉତ୍ତର: {correct_count}\n💯 Accuracy: {round(correct_count * 100 / total_answers) if total_answers else 0}%\n"
+            f"▶️ Chat/Group Runs: {chats}\n\nପ୍ରଶ୍ନ ଅନୁସାରେ ଉତ୍ତର:")
     text += "\n" + "\n".join(f"Q{r['q_no']}: {r['n']} responses, correct {r['correct'] or 0}" for r in per_q)
     await q.message.reply_text(text)
 
@@ -854,7 +755,7 @@ async def show_stats(update, context):
 async def edit_list(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     with connect() as db:
@@ -862,15 +763,13 @@ async def edit_list(update, context):
     if not rows:
         await q.message.reply_text("Edit କରିବାକୁ Quiz ନାହିଁ।")
         return
-    await q.message.reply_text("କେଉଁ Quiz Edit କରିବେ?", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton(r["title"], callback_data=f"editmeta_{r['id']}")] for r in rows
-    ]))
+    await q.message.reply_text("କେଉଁ Quiz Edit କରିବେ?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(r["title"], callback_data=f"editmeta_{r['id']}")] for r in rows]))
 
 
 async def edit_meta_menu(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -883,30 +782,25 @@ async def edit_meta_menu(update, context):
         [InlineKeyboardButton("Quiz Title", callback_data=f"set_title_{quiz_id}")],
         [InlineKeyboardButton("Quiz Intro", callback_data=f"set_intro_{quiz_id}")],
         [InlineKeyboardButton("Motivational Message", callback_data=f"set_motivation_{quiz_id}")],
-        [InlineKeyboardButton("Timer", callback_data=f"set_timer_{quiz_id}")],
-    ]))
+        [InlineKeyboardButton("Timer", callback_data=f"set_timer_{quiz_id}")]]))
 
 
 async def begin_edit_field(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     _, field, quiz_id_text = q.data.split("_", 2)
     quiz_id = int(quiz_id_text)
     context.user_data["edit_field"] = (field, quiz_id)
-    prompts = {
-        "title": "ନୂଆ Quiz Title ଲେଖନ୍ତୁ।",
-        "intro": "ନୂଆ Intro ଲେଖନ୍ତୁ। Intro ଖାଲି କରିବାକୁ - ଲେଖନ୍ତୁ।",
-        "motivation": "ନୂଆ Motivational Message ଲେଖନ୍ତୁ। ଖାଲି କରିବାକୁ - ଲେଖନ୍ତୁ।",
-        "timer": "Timer seconds ଲେଖନ୍ତୁ (5–120)।"
-    }
+    prompts = {"title": "ନୂଆ Quiz Title ଲେଖନ୍ତୁ।", "intro": "ନୂଆ Intro ଲେଖନ୍ତୁ। Intro ଖାଲି କରିବାକୁ - ଲେଖନ୍ତୁ।",
+               "motivation": "ନୂଆ Motivational Message ଲେଖନ୍ତୁ। ଖାଲି କରିବାକୁ - ଲେଖନ୍ତୁ।", "timer": "Timer seconds ଲେଖନ୍ତୁ (5–120)।"}
     await q.message.reply_text(prompts[field] + "\n/cancel_edit ଦେଇ ବାତିଲ୍ କରିପାରିବେ।")
 
 
 async def handle_edit_text(update, context):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         return
     field_data = context.user_data.get("edit_field")
     if not field_data:
@@ -915,17 +809,15 @@ async def handle_edit_text(update, context):
     value = update.effective_message.text.strip()
     if field == "timer":
         try:
-            n = int(value)
-            if not 5 <= n <= 120:
+            value = int(value)
+            if not 5 <= value <= 120:
                 raise ValueError
         except ValueError:
             await update.effective_message.reply_text("5–120 ମଧ୍ୟରେ seconds ଲେଖନ୍ତୁ।")
             return
-        value = n
     else:
-        if value == "-":
-            value = ""
-        value = value[:1000 if field != "title" else 120]
+        value = "" if value == "-" else value
+        value = value[:120 if field == "title" else 1000]
     with connect() as db:
         db.execute(f"UPDATE quizzes SET {field}=? WHERE id=? AND owner_id=?", (value, quiz_id, OWNER_ID))
     context.user_data.pop("edit_field", None)
@@ -935,7 +827,7 @@ async def handle_edit_text(update, context):
 async def edit_question_menu(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -944,28 +836,23 @@ async def edit_question_menu(update, context):
     if not rows:
         await q.message.reply_text("ପ୍ରଶ୍ନ ନାହିଁ।")
         return
-    await q.message.reply_text(
-        "Edit କରିବାକୁ ପ୍ରଶ୍ନ ବାଛନ୍ତୁ। ତା'ପରେ ପୁରା question block (Q1. ... A. ... B. ... C. ... D. ... Correct Answer: B) ପଠାନ୍ତୁ।",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Q{r['q_no']}: {r['question'][:45]}", callback_data=f"editquestion_{quiz_id}_{r['q_no']}")] for r in rows])
-    )
+    await q.message.reply_text("Edit କରିବାକୁ ପ୍ରଶ୍ନ ବାଛନ୍ତୁ। ପୁରା question block (Q1. ... A. ... B. ... C. ... D. ... Correct Answer: B) ପଠାନ୍ତୁ।",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Q{r['q_no']}: {r['question'][:45]}", callback_data=f"editquestion_{quiz_id}_{r['q_no']}")] for r in rows]))
 
 
 async def choose_edit_question(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     _, quiz_id, q_no = q.data.split("_")
     context.user_data["expect_edit_question"] = (int(quiz_id), int(q_no))
-    await q.message.reply_text(
-        f"Q{q_no} ପାଇଁ ନୂଆ question block ପଠାନ୍ତୁ:\n\n"
-        f"Q{q_no}. ପ୍ରଶ୍ନ\nA. Option A\nB. Option B\nC. Option C\nD. Option D\nCorrect Answer: B"
-    )
+    await q.message.reply_text(f"Q{q_no} ପାଇଁ ନୂଆ question block ପଠାନ୍ତୁ:\n\nQ{q_no}. ପ୍ରଶ୍ନ\nA. Option A\nB. Option B\nC. Option C\nD. Option D\nCorrect Answer: B")
 
 
 async def handle_question_edit_text(update, context):
-    if not is_authorized(update.effective_user.id, context):
+    if not is_authorized(update.effective_user.id):
         return
     state = context.user_data.get("expect_edit_question")
     if not state:
@@ -977,10 +864,8 @@ async def handle_question_edit_text(update, context):
     quiz_id, q_no = state
     item = parsed[0]
     with connect() as db:
-        db.execute(
-            "UPDATE questions SET question=?,a=?,b=?,c=?,d=?,answer=? WHERE quiz_id=? AND q_no=?",
-            (item["question"], item["a"], item["b"], item["c"], item["d"], item["answer"], quiz_id, q_no)
-        )
+        db.execute("UPDATE questions SET question=?,a=?,b=?,c=?,d=?,answer=? WHERE quiz_id=? AND q_no=?",
+                   (item["question"], item["a"], item["b"], item["c"], item["d"], item["answer"], quiz_id, q_no))
         db.execute("DELETE FROM responses WHERE quiz_id=? AND q_no=?", (quiz_id, q_no))
     context.user_data.pop("expect_edit_question", None)
     await update.effective_message.reply_text("✅ ପ୍ରଶ୍ନ update ହେଲା।", reply_markup=owner_menu())
@@ -989,20 +874,18 @@ async def handle_question_edit_text(update, context):
 async def delete_ask(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
     await q.message.reply_text("ଏହି Quiz delete କରିବେ?", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("ହଁ, Delete", callback_data=f"delete_{quiz_id}"),
-         InlineKeyboardButton("ନା", callback_data=f"quiz_detail_{quiz_id}")]
-    ]))
+        [InlineKeyboardButton("ହଁ, Delete", callback_data=f"delete_{quiz_id}"), InlineKeyboardButton("ନା", callback_data=f"quiz_detail_{quiz_id}")]]))
 
 
 async def delete_quiz(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     quiz_id = int(q.data.rsplit("_", 1)[1])
@@ -1017,7 +900,7 @@ async def delete_quiz(update, context):
 async def run_quiz_group(update, context):
     q = update.callback_query
     await q.answer()
-    if not is_authorized(q.from_user.id, context):
+    if not is_authorized(q.from_user.id):
         await q.message.reply_text(denied_text())
         return
     _, quiz_id_s, chat_id_s = q.data.split("_", 2)
@@ -1034,53 +917,42 @@ async def run_quiz_group(update, context):
 async def button_router(update, context):
     q = update.callback_query
     data = q.data or ""
-    if data.startswith("vote_"):
-        return await vote(update, context)
-    if data == "myquizzes":
-        return await show_quizzes(update, context)
-    if data == "groups":
-        return await show_groups(update, context)
-    if data == "help":
-        return await help_text(update, context)
-    if data == "txthelp":
-        return await txt_help(update, context)
-    if data == "stats_list":
-        return await stats_list(update, context)
-    if data == "edit_list":
-        return await edit_list(update, context)
-    if data == "share_list":
-        return await show_quizzes(update, context)
-    if data.startswith("quiz_detail_"):
-        return await quiz_detail(update, context)
-    if data.startswith("pickgroup_"):
-        return await pick_group(update, context)
-    if data.startswith("share_"):
-        return await share_quiz(update, context)
-    if data.startswith("stats_"):
-        return await show_stats(update, context)
-    if data.startswith("editmeta_"):
-        return await edit_meta_menu(update, context)
-    if data.startswith("set_title_") or data.startswith("set_intro_") or data.startswith("set_motivation_") or data.startswith("set_timer_"):
-        return await begin_edit_field(update, context)
-    if data.startswith("editq_"):
-        return await edit_question_menu(update, context)
-    if data.startswith("editquestion_"):
-        return await choose_edit_question(update, context)
-    if data.startswith("deleteask_"):
-        return await delete_ask(update, context)
-    if data.startswith("delete_"):
-        return await delete_quiz(update, context)
-    if data.startswith("ownerplay_"):
-        return await owner_play(update, context)
-    if data.startswith("run_"):
-        return await run_quiz_group(update, context)
-    if data in ("more", "save", "cancel_draft"):
-        return await draft_next(update, context)
+    if data.startswith("vote_"): return await vote(update, context)
+    if data == "myquizzes": return await show_quizzes(update, context)
+    if data == "groups": return await show_groups(update, context)
+    if data == "help": return await help_text(update, context)
+    if data == "txthelp": return await txt_help(update, context)
+    if data == "stats_list": return await stats_list(update, context)
+    if data == "edit_list": return await edit_list(update, context)
+    if data == "share_list": return await show_quizzes(update, context)
+    if data.startswith("quiz_detail_"): return await quiz_detail(update, context)
+    if data.startswith("pickgroup_"): return await pick_group(update, context)
+    if data.startswith("share_"): return await share_quiz(update, context)
+    if data.startswith("stats_"): return await show_stats(update, context)
+    if data.startswith("editmeta_"): return await edit_meta_menu(update, context)
+    if data.startswith(("set_title_", "set_intro_", "set_motivation_", "set_timer_")): return await begin_edit_field(update, context)
+    if data.startswith("editq_"): return await edit_question_menu(update, context)
+    if data.startswith("editquestion_"): return await choose_edit_question(update, context)
+    if data.startswith("deleteask_"): return await delete_ask(update, context)
+    if data.startswith("delete_"): return await delete_quiz(update, context)
+    if data.startswith("ownerplay_"): return await owner_play(update, context)
+    if data.startswith("run_"): return await run_quiz_group(update, context)
+    if data in ("more", "save", "cancel_draft"): return await draft_next(update, context)
     await q.answer()
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Telegram handler error: %s", context.error, exc_info=context.error)
+
+
+async def cancel_edit(update, context):
+    if not is_authorized(update.effective_user.id):
+        await update.effective_message.reply_text(denied_text())
+        return
+    context.user_data.pop("edit_field", None)
+    context.user_data.pop("expect_edit_question", None)
+    context.user_data.pop("expect_motivation", None)
+    await update.effective_message.reply_text("Edit ବାତିଲ୍ ହେଲା।", reply_markup=owner_menu())
 
 
 def run_web():
@@ -1091,7 +963,6 @@ def main():
     init_db()
     threading.Thread(target=run_web, daemon=True).start()
     app = Application.builder().token(TOKEN).build()
-
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(create_start, pattern=r"^create$")],
         states={
@@ -1100,28 +971,18 @@ def main():
             INTRO: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_intro)],
             TIMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_timer)],
             MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_motivation)],
-            QUESTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_question),
-                CallbackQueryHandler(draft_next, pattern=r"^(more|save|cancel_draft)$")
-            ],
+            QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_question),
+                       CallbackQueryHandler(draft_next, pattern=r"^(more|save|cancel_draft)$")],
             A: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_a)],
             B: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_b)],
             C: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_c)],
             D: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_d)],
             ANSWER: [CallbackQueryHandler(get_answer, pattern=r"^ans_[ABCD]$")],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("done", done_command),
-            CommandHandler("undo", undo_command),
-        ],
-        allow_reentry=True,
-        per_chat=True,
-        per_user=True,
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("done", done_command), CommandHandler("undo", undo_command)],
+        allow_reentry=True, per_chat=True, per_user=True,
     )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("unlock", unlock))
     app.add_handler(CommandHandler("help", help_text))
     app.add_handler(CommandHandler("register", register_group))
     app.add_handler(CommandHandler("myquizzes", show_quizzes))
@@ -1137,25 +998,12 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_error_handler(on_error)
-
     log.info("SwayamQuizBot starting polling")
-    # Python 3.14 no longer creates a default event loop automatically.
-    # python-telegram-bot's run_polling() expects a current loop, so create one explicitly.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=False)
-
-
-async def cancel_edit(update, context):
-    if not is_authorized(update.effective_user.id, context):
-        await update.effective_message.reply_text(denied_text())
-        return
-    context.user_data.pop("edit_field", None)
-    context.user_data.pop("expect_edit_question", None)
-    context.user_data.pop("expect_motivation", None)
-    await update.effective_message.reply_text("Edit ବାତିଲ୍ ହେଲା।", reply_markup=owner_menu())
 
 
 if __name__ == "__main__":
